@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     
     YOUTUBE_API_KEY: str = ""
+    MODEL_PATH: str = "google/muril-base-cased"
     DEVICE: str = "cpu"
 
     class Config:
