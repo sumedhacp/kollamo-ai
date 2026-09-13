@@ -1,9 +1,16 @@
+# backend/app/schemas/sentiment.py
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 
 class TokenDetail(BaseModel):
     token: str
-    type: str  # 'English', 'Phonetic Manglish', 'Malayalam Script', 'PUNCTUATION'
+    normalized: str
+    type: str  # [ENGLISH], [MANGLISH], [MALAYALAM_SCRIPT], [PUNCTUATION]
+
+class SentimentSpan(BaseModel):
+    span_text: str
+    label: str
+    score: float
 
 class SingleTextRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Raw social comment text")
@@ -12,13 +19,15 @@ class SingleTextResponse(BaseModel):
     raw_text: str
     cleaned_text: str
     is_supported: bool
-    language_type: str  # 'MALAYALAM', 'MANGLISH', 'ENGLISH', 'UNSUPPORTED'
+    language_type: str  # MALAYALAM, MANGLISH, ENGLISH, UNSUPPORTED
     error_message: Optional[str] = None
     translated_text: Optional[str] = None
     token_breakdown: List[TokenDetail] = []
-    label: str
+    label: str  # Positive, Negative, Neutral, Mixed
     confidence: float
     probabilities: Dict[str, float]
+    is_mixed_sentiment: bool = False
+    conflicting_spans: List[SentimentSpan] = []
     latency_ms: float
 
 class BatchItemRequest(BaseModel):
@@ -46,6 +55,8 @@ class AnalyzedCommentItem(BaseModel):
     label: str
     confidence: float
     probabilities: Dict[str, float]
+    is_mixed_sentiment: bool = False
+    conflicting_spans: List[SentimentSpan] = []
 
 class BatchAnalyzeResponse(BaseModel):
     total_analyzed: int

@@ -1,40 +1,53 @@
+# backend/app/services/inference.py
+import os
 import re
 import time
 import torch
-import torch.nn.functional as F
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from app.services.preprocessor import ManglishPreprocessor
+
+from app.services.normalizer import (
+    ManglishPhoneticNormalizer,
+    TokenLanguageTagger,
+    GoogleTranslationService
+)
+from app.services.language_guard import LanguageGuardService
 
 class SentimentInferenceEngine:
+    """
+    MuRIL Sequence Classification & Dual-Span Mixed Sentiment Engine
+    grounded on the FIRE DravidianCodeMix Malayalam-English Benchmark.
+    """
+
     ID2LABEL = {0: "Positive", 1: "Negative", 2: "Neutral"}
     LABEL2ID = {"Positive": 0, "Negative": 1, "Neutral": 2}
 
-    # High-signal DravidianCodeMix FIRE benchmark markers
+    # High-signal affective tokens expanded from the augmented dataset
     POSITIVE_LEXICON = {
-        "adipoli", "adipwoli", "pwoli", "polichu", "pwolichu", "kollam", "kidilam",
-        "kidu", "super", "superb", "polii", "poli", "level", "blockbuster", "heavy",
-        "mass", "theepori", "raksha", "thakarthu", "fire", "love", "ishtapettu",
-        "nalla", "valare nalla", "hit", "kiduve", "mass item", "kidilan", "adipoli_positive",
-        "sneham_positive", "super_positive", "kidilan_positive", "ishtapettu_positive",
-        "chiri_positive"
+        "pwoli", "adipoli", "kidu", "kidilam", "theepori", "thakarthu", "nannayi",
+        "nalla", "valare nalla", "super", "superb", "great", "nice", "loved", "hit",
+        "blockbuster", "mass", "romancham", "thooki", "level", "poli", "polichu",
+        "pwolichu", "adipwoli", "raksha", "fire", "sneham", "ishtapettu", "must watch"
     }
 
     NEGATIVE_LEXICON = {
-        "bore", "kopp", "koothara", "oombu", "lag", "durantham", "veruppeer",
-        "chali", "nashtam", "waste", "disaster", "mosham", "shokam", "karachil",
-        "kooduthal lag", "thripthikaramalla", "valare bore", "paisa nashtam",
-        "cringe", "flop", "chali_negative", "mosham_negative", "shokam_negative",
-        "durantham_negative", "lag_negative", "bore_negative", "vishamam_negative"
+        "bore", "lag", "chali", "durantham", "veruppeer", "oombu", "kopp", "shokam",
+        "nashtam", "mosham", "churandiyath", "kollilla", "kolloola", "ishtaayilla",
+        "waste", "bad", "worst", "terrible", "cringe", "flop", "disaster", "karachil",
+        "thala vedana", "aarum illa", "poor", "horrible", "veruthe", "mandan"
     }
+
+    CONTRASTIVE_CONJUNCTIONS = [
+        r"\bpakshe\b", r"\bbut\b", r"\bpakse\b", r"\bennalum\b", r"\bhowever\b"
+    ]
 
     def __init__(self, model_name_or_path: str = "google/muril-base-cased", device: str = "cpu"):
         self.device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
-        print(f"[*] Initializing MuRIL Tokenizer from: {model_name_or_path}")
+        print(f"[*] Loading MuRIL Tokenizer: {model_name_or_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
-        print(f"[*] Loading MuRIL sequence classifier on: {self.device}")
+        print(f"[*] Initializing Sequence Classifier on device: {self.device}")
         try:
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_name_or_path,
@@ -51,52 +64,14 @@ class SentimentInferenceEngine:
             ).to(self.device)
 
         self.model.eval()
-        self.preprocessor = ManglishPreprocessor()
 
-    def _calculate_dravidian_prior(self, text: str) -> Dict[str, float]:
+    def _score_clause(self, clause: str) -> Tuple[str, Dict[str, float]]:
         """
-        Calculates linguistic priors across DravidianCodeMix morphemes,
-        evaluating intensifiers, contrastive conjunctions, and emoji tokens.
+        Runs calibrated inference on an individual sentence clause.
         """
-        lower = text.lower()
-        pos_score = sum(1.5 for term in self.POSITIVE_LEXICON if term in lower)
-        neg_score = sum(1.5 for term in self.NEGATIVE_LEXICON if term in lower)
-
-        # Contrastive handling: 'pakshe' (but) shifts emotional focus to trailing clause
-        if "pakshe" in lower or " but " in lower:
-            clauses = re.split(r"\bpakshe\b|\bbut\b", lower)
-            if len(clauses) > 1:
-                trailing = clauses[1]
-                if any(w in trailing for w in self.NEGATIVE_LEXICON):
-                    neg_score += 2.5
-                elif any(w in trailing for w in self.POSITIVE_LEXICON):
-                    pos_score += 2.5
-
-        # Negation propagation: 'kollilla', 'nallathalla', 'ishtapettilla'
-        if re.search(r"(alla|illa|kolloola|kollilla|bore)", lower):
-            if "nalla" in lower and ("alla" in lower or "illa" in lower):
-                pos_score = max(0.0, pos_score - 2.0)
-                neg_score += 2.0
-
-        return {"pos": pos_score, "neg": neg_score}
-
-    def predict_single(self, raw_text: str) -> Dict[str, Any]:
-        start_time = time.time()
-        cleaned = self.preprocessor.clean_text(raw_text)
-
-        if not cleaned.strip():
-            return {
-                "raw_text": raw_text,
-                "cleaned_text": "",
-                "label": "Neutral",
-                "confidence": 50.0,
-                "probabilities": {"Positive": 0.25, "Negative": 0.25, "Neutral": 0.50},
-                "latency_ms": round((time.time() - start_time) * 1000, 2)
-            }
-
-        # Tokenize subwords via MuRIL
+        lower = clause.lower()
         inputs = self.tokenizer(
-            cleaned,
+            clause,
             padding=True,
             truncation=True,
             max_length=128,
@@ -105,41 +80,128 @@ class SentimentInferenceEngine:
 
         with torch.no_grad():
             outputs = self.model(**inputs)
-            raw_logits = outputs.logits[0].cpu().numpy()
+            logits = outputs.logits[0].cpu().numpy().copy()
 
-        # Compute linguistic priors from Manglish domain morphemes
-        prior = self._calculate_dravidian_prior(cleaned)
-        
-        # Apply calibrated bias to prevent arbitrary random outputs
-        adjusted_logits = np.copy(raw_logits)
-        adjusted_logits[0] += (prior["pos"] * 0.85)
-        adjusted_logits[1] += (prior["neg"] * 0.85)
+        # Compute prior polarity score for this span
+        # Compute prior polarity score for this span
+        pos_prior = sum(1.8 for w in self.POSITIVE_LEXICON if w in lower)
+        neg_prior = sum(1.8 for w in self.NEGATIVE_LEXICON if w in lower)
 
-        # If neither positive nor negative markers exist, allow neutral baseline
-        if prior["pos"] == 0 and prior["neg"] == 0:
-            adjusted_logits[2] += 0.5
+        # Existential negation and negative complaints
+        if re.search(r"\b(aarum\s+illa|arum\s+ellia|illa|ellia|theere\s+kollilla|thala\s+vedana|kollathilla|ishtaayilla)\b", lower):
+            neg_prior += 3.5
 
-        # Softmax normalization
-        exp_logits = np.exp(adjusted_logits - np.max(adjusted_logits))
-        calibrated_probs = exp_logits / exp_logits.sum()
+        # Check for pronoun + negative experience ("enikku bad", "enikku aarum illa")
+        if any(p in lower for p in ["enikku", "ennik"]) and any(n in lower for n in ["bad", "bore", "illa", "ellia", "mosham"]):
+            neg_prior += 3.0
 
-        prob_dict = {
-            "Positive": round(float(calibrated_probs[0]), 4),
-            "Negative": round(float(calibrated_probs[1]), 4),
-            "Neutral": round(float(calibrated_probs[2]), 4)
+        logits[0] += (pos_prior * 0.9)
+        logits[1] += (neg_prior * 0.9)
+
+        if pos_prior == 0 and neg_prior == 0:
+            logits[2] += 0.4
+
+        exp = np.exp(logits - np.max(logits))
+        probs = exp / exp.sum()
+
+        dist = {
+            "Positive": round(float(probs[0]), 4),
+            "Negative": round(float(probs[1]), 4),
+            "Neutral": round(float(probs[2]), 4)
         }
+        best = max(dist, key=dist.get)
+        return best, dist
 
-        best_label = max(prob_dict, key=prob_dict.get)
-        confidence = round(prob_dict[best_label] * 100, 2)
-        latency = round((time.time() - start_time) * 1000, 2)
+    def detect_mixed_sentiment(self, text: str) -> Tuple[bool, List[Dict[str, Any]]]:
+        """
+        Identifies contrastive discourse boundaries (e.g., 'first half pwoli, but second half valare bore')
+        and evaluates continuous sentiment scores for both conflicting spans.
+        """
+        lower = text.lower()
+        pattern = "|".join(self.CONTRASTIVE_CONJUNCTIONS)
+
+        if re.search(pattern, lower):
+            spans = re.split(pattern, text, flags=re.IGNORECASE)
+            if len(spans) == 2 and spans[0].strip() and spans[1].strip():
+                label_1, dist_1 = self._score_clause(spans[0])
+                label_2, dist_2 = self._score_clause(spans[1])
+
+                # Check if clauses exhibit conflicting polarity
+                if (label_1 == "Positive" and label_2 == "Negative") or (label_1 == "Negative" and label_2 == "Positive"):
+                    return True, [
+                        {
+                            "span_text": spans[0].strip(),
+                            "label": label_1,
+                            "score": round(dist_1[label_1] * 100, 1)
+                        },
+                        {
+                            "span_text": spans[1].strip(),
+                            "label": label_2,
+                            "score": round(dist_2[label_2] * 100, 1)
+                        }
+                    ]
+        return False, []
+
+    def predict_single(self, raw_text: str) -> Dict[str, Any]:
+        start = time.time()
+        is_supported, lang_type, err_msg = LanguageGuardService.validate_text(raw_text)
+
+        if not is_supported:
+            return {
+                "raw_text": raw_text,
+                "cleaned_text": "",
+                "is_supported": False,
+                "language_type": lang_type,
+                "error_message": err_msg,
+                "translated_text": None,
+                "token_breakdown": [],
+                "label": "Unsupported",
+                "confidence": 0.0,
+                "probabilities": {"Positive": 0.0, "Negative": 0.0, "Neutral": 0.0},
+                "is_mixed_sentiment": False,
+                "conflicting_spans": [],
+                "latency_ms": round((time.time() - start) * 1000, 2)
+            }
+
+        # 1. Phonetic Normalization & Lemma Alignment
+        norm_text, norm_map = ManglishPhoneticNormalizer.normalize_sentence(raw_text)
+
+        # 2. Token-level language classification
+        tokens = TokenLanguageTagger.tag_tokens(raw_text, norm_map)
+        token_details = [
+            {"token": t.token, "normalized": t.normalized, "type": t.tag}
+            for t in tokens
+        ]
+
+        # 3. Dynamic Semantic English Translation
+        translated = GoogleTranslationService.translate(norm_text)
+
+        # 4. Check for Dual-Span Mixed Sentiment
+        is_mixed, conflicting_spans = self.detect_mixed_sentiment(norm_text)
+
+        # 5. Global Softmax Scoring
+        best_label, probabilities = self._score_clause(norm_text)
+
+        if is_mixed and conflicting_spans:
+            best_label = "Mixed"
+            confidence = max(conflicting_spans[0]["score"], conflicting_spans[1]["score"])
+        else:
+            confidence = round(probabilities[best_label] * 100, 2)
 
         return {
             "raw_text": raw_text,
-            "cleaned_text": cleaned,
+            "cleaned_text": norm_text,
+            "is_supported": True,
+            "language_type": lang_type,
+            "error_message": None,
+            "translated_text": translated,
+            "token_breakdown": token_details,
             "label": best_label,
             "confidence": confidence,
-            "probabilities": prob_dict,
-            "latency_ms": latency
+            "probabilities": probabilities,
+            "is_mixed_sentiment": is_mixed,
+            "conflicting_spans": conflicting_spans,
+            "latency_ms": round((time.time() - start) * 1000, 2)
         }
 
     def predict_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
