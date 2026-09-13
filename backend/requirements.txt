@@ -16,3 +16,5 @@ datasets>=2.14.0
 pandas>=2.0.0
 google-cloud-translate>=3.12.0
 deep-translator>=1.11.4
+
+instaloader>=4.10.0
