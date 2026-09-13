@@ -10,8 +10,9 @@ class CommentItem(BaseModel):
     published_at: str
 
 class ScrapeRequest(BaseModel):
-    url: HttpUrl = Field(..., description="Public YouTube video URL")
-    max_comments: int = Field(default=50, ge=1, le=500, description="Number of comments to fetch")
+    url: HttpUrl = Field(..., description="Public video or post URL")
+    max_comments: int = Field(default=50, ge=1, le=200, description="Comment volume")
+    sort_order: str = Field(default="top", description="'top' or 'newest'")
 
 class ScrapeResponse(BaseModel):
     platform: str
