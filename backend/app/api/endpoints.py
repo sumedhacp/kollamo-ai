@@ -1,183 +1,130 @@
-from fastapi import APIRouter, HTTPException, Depends
-from app.core.config import settings
-from app.schemas.scraper import ScrapeRequest, ScrapeResponse
+# backend/app/api/endpoints.py
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional, List
+
 from app.schemas.sentiment import (
-    SingleTextRequest, SingleTextResponse,
-    BatchAnalyzeRequest, BatchAnalyzeResponse, AnalyzedCommentItem
+    SingleTextRequest,
+    SingleTextResponse,
+    BatchAnalyzeRequest,
+    BatchAnalyzeResponse,
+    AnalyzedCommentItem
 )
-from app.services.scraper import SocialScraperService
+from app.schemas.scraper import ScrapeRequest, ScrapeResponse
 from app.services.inference import SentimentInferenceEngine
-from app.services.language_guard import LanguageGuardService
-from app.services.translator import ManglishTranslatorService
+from app.services.scraper import SocialScraperService
+from app.services.summary_generator import ExecutiveReviewGenerator
 
-router = APIRouter(prefix=settings.API_V1_PREFIX)
+router = APIRouter()
 
-_inference_engine = None
+# Instantiate transformer pipeline once on startup
+inference_engine = SentimentInferenceEngine(model_name_or_path="google/muril-base-cased", device="cpu")
 
-def get_inference_engine() -> SentimentInferenceEngine:
-    global _inference_engine
-    if _inference_engine is None:
-        _inference_engine = SentimentInferenceEngine(
-            model_name_or_path=settings.MODEL_PATH,
-            device=settings.DEVICE
-        )
-    return _inference_engine
-
-@router.post("/analyze-text", response_model=SingleTextResponse, tags=["Single Text Sandbox"])
-async def analyze_single_text(
-    payload: SingleTextRequest,
-    engine: SentimentInferenceEngine = Depends(get_inference_engine)
-):
+@router.post("/analyze-single", response_model=SingleTextResponse, tags=["Inference"])
+def analyze_single_comment(request: SingleTextRequest):
     """
-    Evaluates a single comment: runs language guardrail, token breakdown,
-    semantic translation, and calibrated MuRIL sentiment inference.
-    """
-    raw_text = payload.text.strip()
-    is_supported, lang_type, err_msg = LanguageGuardService.validate_text(raw_text)
-
-    if not is_supported:
-        return SingleTextResponse(
-            raw_text=raw_text,
-            cleaned_text="",
-            is_supported=False,
-            language_type=lang_type,
-            error_message=err_msg,
-            translated_text=None,
-            token_breakdown=[],
-            label="Unsupported",
-            confidence=0.0,
-            probabilities={"Positive": 0.0, "Negative": 0.0, "Neutral": 0.0},
-            latency_ms=1.5
-        )
-
-    tokens = ManglishTranslatorService.get_token_breakdown(raw_text)
-    translation = ManglishTranslatorService.translate_manglish_to_english(raw_text)
-    prediction = engine.predict_single(raw_text)
-
-    return SingleTextResponse(
-        raw_text=raw_text,
-        cleaned_text=prediction["cleaned_text"],
-        is_supported=True,
-        language_type=lang_type,
-        error_message=None,
-        translated_text=translation,
-        token_breakdown=tokens,
-        label=prediction["label"],
-        confidence=prediction["confidence"],
-        probabilities=prediction["probabilities"],
-        latency_ms=prediction["latency_ms"]
-    )
-
-@router.post("/fetch-comments", response_model=ScrapeResponse, tags=["Social Link Studio"])
-async def fetch_comments(payload: ScrapeRequest):
-    """
-    Extracts authentic comments from YouTube, Instagram, or X without capturing UI button artifacts.
+    Analyzes an individual comment:
+    - Normalizes informal Manglish phonetics & collapses vowel repeats
+    - Enforces language guardrails (Malayalam, Manglish, English only)
+    - Tags token linguistic categories ([ENGLISH], [MANGLISH], [MALAYALAM_SCRIPT])
+    - Provides semantic English translation
+    - Evaluates calibrated multi-class distribution and dual-span mixed sentiment
     """
     try:
-        platform, video_id, comments = SocialScraperService.get_comments(
-            url=str(payload.url),
-            api_key=settings.YOUTUBE_API_KEY,
-            max_comments=payload.max_comments,
-            sort_order=payload.sort_order
-        )
-        return {
-            "platform": platform,
-            "video_id": video_id,
-            "total_extracted": len(comments),
-            "comments": comments
-        }
-    except ValueError as ve:
-        raise HTTPException(status_code=422, detail=str(ve))
+        result = inference_engine.predict_single(request.text)
+        return SingleTextResponse(**result)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Extraction failure: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+@router.post("/scrape-comments", response_model=ScrapeResponse, tags=["Scraper"])
+def scrape_social_comments(request: ScrapeRequest):
+    """
+    Extracts authentic user comments from public YouTube or Instagram links.
+    Filters UI artifacts, channel headers, and player controls.
+    """
+    try:
+        platform, media_id, comments = SocialScraperService.get_comments(
+            url=str(request.url),
+            max_comments=request.max_comments,
+            sort_order=request.sort_order
+        )
+        return ScrapeResponse(
+            platform=platform,
+            media_id=media_id,
+            total_extracted=len(comments),
+            sort_order=request.sort_order,
+            comments=comments
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scraper error: {str(e)}")
 
 @router.post("/analyze-batch", response_model=BatchAnalyzeResponse, tags=["Batch Analytics"])
-async def analyze_batch_comments(
-    payload: BatchAnalyzeRequest,
-    engine: SentimentInferenceEngine = Depends(get_inference_engine)
-):
+def analyze_batch_comments(request: BatchAnalyzeRequest):
     """
-    Batch evaluates comments: filters unsupported languages, executes MuRIL inference,
-    translates Manglish to English, and computes global KPI metrics.
+    Executes full pipeline analysis over curated comments:
+    Inference + Token Tagging + Translation + Executive Review Summary generation.
     """
-    if not payload.comments:
-        raise HTTPException(status_code=400, detail="Comment payload list is empty.")
+    if not request.comments:
+        raise HTTPException(status_code=400, detail="Comments payload cannot be empty.")
 
-    analyzed_items = []
-    distribution = {"Positive": 0, "Negative": 0, "Neutral": 0}
-    supported_count = 0
-    unsupported_count = 0
-    valid_items_to_predict = []
+    analyzed_items: List[AnalyzedCommentItem] = []
+    distribution = {"Positive": 0, "Negative": 0, "Neutral": 0, "Mixed": 0, "Unsupported": 0}
 
-    # Step 1: Language Guardrail Partitioning
-    for item in payload.comments:
-        is_supported, lang_type, err_msg = LanguageGuardService.validate_text(item.text)
-        if not is_supported:
-            unsupported_count += 1
-            analyzed_items.append(
-                AnalyzedCommentItem(
-                    comment_id=item.comment_id,
-                    comment=item.text,
-                    cleaned_comment="",
-                    author=item.author or "Anonymous",
-                    like_count=item.like_count or 0,
-                    published_at=item.published_at or "Recent",
-                    is_supported=False,
-                    language_type=lang_type,
-                    error_message=err_msg,
-                    translated_text=None,
-                    token_breakdown=[],
-                    label="Unsupported",
-                    confidence=0.0,
-                    probabilities={"Positive": 0.0, "Negative": 0.0, "Neutral": 0.0}
-                )
+    for item in request.comments:
+        pred = inference_engine.predict_single(item.text)
+        label = pred["label"]
+        distribution[label] = distribution.get(label, 0) + 1
+
+        analyzed_items.append(
+            AnalyzedCommentItem(
+                comment_id=item.comment_id,
+                comment=item.text,
+                cleaned_comment=pred["cleaned_text"],
+                author=item.author or "Anonymous",
+                like_count=item.like_count or 0,
+                published_at=item.published_at or "Recent",
+                is_supported=pred["is_supported"],
+                language_type=pred["language_type"],
+                error_message=pred["error_message"],
+                translated_text=pred["translated_text"],
+                token_breakdown=pred["token_breakdown"],
+                label=pred["label"],
+                confidence=pred["confidence"],
+                probabilities=pred["probabilities"],
+                is_mixed_sentiment=pred["is_mixed_sentiment"],
+                conflicting_spans=pred["conflicting_spans"]
             )
-        else:
-            supported_count += 1
-            valid_items_to_predict.append(item)
-
-    # Step 2: Inference & Translation for Supported Items
-    if valid_items_to_predict:
-        texts = [c.text for c in valid_items_to_predict]
-        predictions = engine.predict_batch(texts)
-
-        for c, pred in zip(valid_items_to_predict, predictions):
-            distribution[pred["label"]] += 1
-            tokens = ManglishTranslatorService.get_token_breakdown(c.text)
-            trans = ManglishTranslatorService.translate_manglish_to_english(c.text)
-
-            analyzed_items.append(
-                AnalyzedCommentItem(
-                    comment_id=c.comment_id,
-                    comment=c.text,
-                    cleaned_comment=pred["cleaned_text"],
-                    author=c.author or "Anonymous",
-                    like_count=c.like_count or 0,
-                    published_at=c.published_at or "Recent",
-                    is_supported=True,
-                    language_type="MANGLISH",
-                    error_message=None,
-                    translated_text=trans,
-                    token_breakdown=tokens,
-                    label=pred["label"],
-                    confidence=pred["confidence"],
-                    probabilities=pred["probabilities"]
-                )
-            )
+        )
 
     total = len(analyzed_items)
-    percentages = {
-        k: round((v / supported_count) * 100, 2) if supported_count > 0 else 0.0
-        for k, v in distribution.items()
-    }
-    net_score = round(percentages["Positive"] - percentages["Negative"], 2)
+    supported_items = [c for c in analyzed_items if c.is_supported]
+    supported_count = len(supported_items)
+    unsupported_count = total - supported_count
 
-    return {
-        "total_analyzed": total,
-        "supported_count": supported_count,
-        "unsupported_count": unsupported_count,
-        "sentiment_distribution": distribution,
-        "sentiment_percentages": percentages,
-        "net_sentiment_score": net_score,
-        "comments": analyzed_items
+    percentages = {
+        k: round((v / supported_count) * 100, 1) if supported_count > 0 else 0.0
+        for k, v in distribution.items()
+        if k != "Unsupported"
     }
+
+    nss = round(percentages.get("Positive", 0.0) - percentages.get("Negative", 0.0), 1)
+
+    return BatchAnalyzeResponse(
+        total_analyzed=total,
+        supported_count=supported_count,
+        unsupported_count=unsupported_count,
+        sentiment_distribution=distribution,
+        sentiment_percentages=percentages,
+        net_sentiment_score=nss,
+        comments=analyzed_items
+    )
+
+@router.post("/generate-summary", tags=["Analytics Summary"])
+def generate_executive_summary(comments: List[AnalyzedCommentItem]):
+    """
+    Generates an executive audience reception briefing for a set of analyzed comments.
+    """
+    dict_items = [c.dict() for c in comments]
+    summary = ExecutiveReviewGenerator.generate_summary(dict_items)
+    return summary
