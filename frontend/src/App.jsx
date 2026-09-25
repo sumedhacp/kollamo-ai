@@ -1,49 +1,148 @@
+// src/App.jsx
 import React, { useState } from 'react';
-import { Sparkles, MessageSquareCode } from 'lucide-react';
-import Zone1Sandbox from './components/Zone1Sandbox';
-import Zone2Extractor from './components/Zone2Extractor';
-import Zone3Dashboard from './components/Zone3Dashboard';
+import Navbar from './components/Navbar';
+import OverviewTab from './components/OverviewTab';
+import SandboxTab from './components/SandboxTab';
+import SocialStudioTab from './components/SocialStudioTab';
+import AnalyticsTab from './components/AnalyticsTab';
 
 export default function App() {
-  const [batchTelemetry, setBatchTelemetry] = useState(null);
+  const [activeTab, setActiveTab] = useState('overview');
+  
+  // Real analyzed comments returned by the backend
+  const [analyzedBatch, setAnalyzedBatch] = useState([]);
+  
+  // Real executive summary & global sentiment metrics
+  const [batchMetrics, setBatchMetrics] = useState(null);
+  
+  // Loading & error state during batch processing
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState('');
+
+  // Primary Batch Pipeline: Sends scraped comments to backend /api/analyze-batch
+  const handleRunBatchInference = async (selectedComments) => {
+    if (!selectedComments || selectedComments.length === 0) {
+      alert("No comments selected for analysis.");
+      return;
+    }
+
+    setIsAnalyzing(true);
+    setAnalyzeError('');
+
+    try {
+      // 1. Structure payload exactly matching BatchAnalyzeRequest schema
+      const payload = {
+        comments: selectedComments.map((c, idx) => ({
+          comment_id: String(c.id || `c_${idx}`),
+          text: String(c.text || c.comment_payload || ''),
+          author: String(c.author || '@anonymous'),
+          like_count: Number(c.likes || c.like_count || 0),
+          published_at: String(c.date || c.published_at || 'Recent')
+        }))
+      };
+
+      // 2. Call FastAPI Batch Inference Endpoint
+      const response = await fetch('http://127.0.0.1:8000/api/analyze-batch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const errDetail = await response.json().catch(() => ({}));
+        throw new Error(errDetail.detail || `Server returned HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      // 3. Format backend AnalyzedCommentItem records into state
+      const processedItems = data.comments.map((item) => ({
+        id: item.comment_id,
+        author: item.author,
+        text: item.comment,
+        cleaned_text: item.cleaned_comment,
+        translation: item.translated_text || item.comment, // Dynamic individual translation
+        sentiment: String(item.label).toUpperCase(),        // POSITIVE, NEGATIVE, NEUTRAL, MIXED
+        confidence: Math.round(item.confidence),
+        probabilities: item.probabilities,
+        likes: item.like_count,
+        date: item.published_at,
+        is_supported: item.is_supported,
+        language_type: item.language_type,
+        tokens: item.token_breakdown
+      }));
+
+      setAnalyzedBatch(processedItems);
+
+      // 4. Update macro distribution & telemetry
+      setBatchMetrics({
+        total: data.total_analyzed,
+        supported: data.supported_count,
+        unsupported: data.unsupported_count,
+        distribution: data.sentiment_distribution,
+        percentages: data.sentiment_percentages,
+        nss: data.net_sentiment_score
+      });
+
+      // 5. Navigate to Analytics Tab
+      setActiveTab('analytics');
+
+    } catch (err) {
+      console.error("Batch Analysis Execution Failed:", err);
+      setAnalyzeError(err.message || "Failed to process batch analysis.");
+      alert(`Batch Inference Error: ${err.message}`);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 p-6 md:p-10 selection:bg-emerald-500 selection:text-black">
-      {/* Global Navigation Header */}
-      <header className="max-w-6xl mx-auto mb-10 flex flex-col items-center text-center space-y-2">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold">
-          <MessageSquareCode className="w-3.5 h-3.5" />
-          <span>Romanized Dravidian NLP Intelligence</span>
-        </div>
-        <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight text-white flex items-center gap-3">
-          <span>Kollamo.ai</span>
-        </h1>
-        <p className="text-slate-400 text-sm max-w-2xl">
-          End-to-end sentiment classification dashboard for Malayalam-English (Manglish) social media text, powered by Google's MuRIL transformer architecture.
-        </p>
-      </header>
+    <div className="app-container">
+      <Navbar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {/* 3-Zone Interactive Workspace */}
-      <main className="max-w-6xl mx-auto space-y-8">
-        {/* ZONE 1: Direct Single-Text Sandbox */}
-        <section>
-          <Zone1Sandbox />
-        </section>
+      <main className="main-content">
+        {activeTab === 'overview' && (
+          <OverviewTab setActiveTab={setActiveTab} />
+        )}
 
-        {/* ZONE 2: Social Media Link Ingestion & Auditor */}
-        <section>
-          <Zone2Extractor onBatchAnalyzed={(data) => setBatchTelemetry(data)} />
-        </section>
+        {activeTab === 'sandbox' && (
+          <SandboxTab />
+        )}
 
-        {/* ZONE 3: Visual Dashboard & Filtering Matrix */}
-        <section>
-          <Zone3Dashboard batchData={batchTelemetry} />
-        </section>
+        {activeTab === 'studio' && (
+          <SocialStudioTab 
+            onAnalyze={handleRunBatchInference} 
+            setActiveTab={setActiveTab} 
+            isAnalyzing={isAnalyzing}
+          />
+        )}
+
+        {activeTab === 'analytics' && (
+          <AnalyticsTab 
+            data={analyzedBatch} 
+            metrics={batchMetrics} 
+            setActiveTab={setActiveTab} 
+          />
+        )}
       </main>
 
-      {/* Footer */}
-      <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-slate-800/80 text-center text-xs text-slate-500">
-        Kollamo.ai &bull; Major Academic Project &bull; Federal Institute of Science and Technology (FISAT)
+      <footer style={{
+        borderTop: '1px solid var(--border-color)',
+        backgroundColor: 'var(--bg-surface)',
+        padding: '1.5rem 1.5rem',
+        textAlign: 'center',
+        fontSize: '0.75rem',
+        color: 'var(--text-subtle)'
+      }}>
+        <div style={{ fontWeight: '600', color: 'var(--text-main)' }}>
+          Kollamo.ai v1.0 • Multilingual Social Intelligence Platform
+        </div>
+        <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.6875rem', marginTop: '0.35rem', color: 'var(--text-subtle)' }}>
+          Calibrated Transformer Inference Engine for Code-Mixed Dravidian Dialects
+        </div>
       </footer>
     </div>
   );

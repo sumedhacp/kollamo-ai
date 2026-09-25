@@ -1,396 +1,199 @@
 # backend/app/services/normalizer.py
-import os
 import re
+import html
 import unicodedata
-import json
-import requests
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from pydantic import BaseModel
 
 class TokenTag(BaseModel):
     token: str
     normalized: str
-    tag: str  # [ENGLISH], [MANGLISH], [MALAYALAM_SCRIPT], [PUNCTUATION]
+    tag: str
+    type: str
 
-class ManglishPhoneticNormalizer:
-    """
-    Syllable-aware phonetic normalizer for Romanized Malayalam.
-    Collapses elongations, handles digraph variance (pw/th/zh), preserves Unicode
-    grapheme clusters, and maps spelling variants to canonical root lemmas.
-    """
-
-    CANONICAL_LEMMA_MAP: Dict[str, str] = {
-        "poli": "pwoli", "pwoli": "pwoli", "polichu": "pwolichu", "pwolichu": "pwolichu",
-        "adipoli": "adipoli", "adipwoli": "adipoli", "athipoli": "adipoli", "athipwoli": "adipoli",
-        "athipoly": "adipoli", "adipoly": "adipoli", "adhipoli": "adipoli",
-        "kollam": "kollam", "kolam": "kollam", "kollaam": "kollam", "kollamm": "kollam",
-        "kollilla": "kollilla", "kolloola": "kollilla",
-        "kidu": "kidu", "kidilam": "kidilam", "kidhilan": "kidilam", "kidilan": "kidilam",
-        "theepori": "theepori", "theepwori": "theepori", "thakarthu": "thakarthu",
-        "nannayi": "nannayi", "nannaayi": "nannayi", "nannaytund": "nannayittund",
-        "nalla": "nalla", "nala": "nalla", "valare": "valare",
-        "ishtam": "ishtam", "ishtapettu": "ishtapettu", "ishtaayi": "ishtapettu",
-        "bore": "bore", "bor": "bore", "boar": "bore",
-        "lag": "lag", "laag": "lag", "lagg": "lag",
-        "chali": "chali", "chaly": "chali", "durantham": "durantham", "durantam": "durantham",
-        "veruppeer": "veruppeer", "veruppir": "veruppeer", "oombu": "oombu", "oombi": "oombu",
-        "kopp": "kopp", "kop": "kopp", "shokam": "shokam", "sokam": "shokam",
-        "nashtam": "nashtam", "nastam": "nashtam", "mosham": "mosham", "mosam": "mosham",
-        "ennik": "enikku", "enikk": "enikku", "enikku": "enikku", "eniku": "enikku",
-        "njan": "njan", "njaan": "njan", "pakshe": "pakshe", "pakse": "pakshe",
-        "aanu": "aanu", "aan": "aanu", "anu": "aanu",
-        "aayirunnu": "aayirunnu", "aarnnu": "aayirunnu", "aayirnu": "aayirunnu",
-        "aayi": "aayi", "ayi": "aayi", "aayittund": "aayittund", "ayittund": "aayittund",
-        "padam": "padam", "paadam": "padam", "cinema": "cinema", "sinima": "cinema",
-        "theere": "theere", "thala": "thala", "vedana": "vedana", "eduthu": "eduthu"
-    }
-
-    @classmethod
-    def collapse_elongations(cls, text: str) -> str:
-        text = re.sub(r"([b-df-hj-np-tv-zB-DF-HJ-NP-TV-Z])\1{2,}", r"\1", text)
-        text = re.sub(r"([aeiouAEIOU])\1{2,}", r"\1\1", text)
-        return text
-
-    @classmethod
-    def phonetic_sound_cluster(cls, word: str) -> str:
-        w = word.lower()
-        if w in cls.CANONICAL_LEMMA_MAP:
-            return cls.CANONICAL_LEMMA_MAP[w]
-
-        w_norm = re.sub(r"\bpw", "p", w)
-        w_norm = re.sub(r"\bbw", "b", w_norm)
-        w_norm = re.sub(r"th", "t", w_norm)
-        w_norm = re.sub(r"dh", "d", w_norm)
-        w_norm = re.sub(r"zh", "l", w_norm)
-        w_norm = re.sub(r"aa", "a", w_norm)
-        w_norm = re.sub(r"ee", "i", w_norm)
-        w_norm = re.sub(r"oo", "u", w_norm)
-        w_norm = re.sub(r"(.)\1+", r"\1", w_norm)
-
-        for raw_variant, canonical in cls.CANONICAL_LEMMA_MAP.items():
-            candidate = re.sub(r"(.)\1+", r"\1", (
-                raw_variant.replace("aa", "a")
-                           .replace("ee", "i")
-                           .replace("th", "t")
-                           .replace("dh", "d")
-                           .replace("zh", "l")
-                           .replace("pw", "p")
-            ))
-            if w_norm == candidate:
-                return canonical
-
-        return w
-
-    @classmethod
-    def normalize_sentence(cls, sentence: str) -> Tuple[str, Dict[str, str]]:
-        collapsed = cls.collapse_elongations(sentence)
-        tokens = re.findall(r"[\u0D00-\u0D7F]+|[a-zA-Z0-9']+|[^\w\s]", collapsed)
-        normalized_tokens = []
-        transformations = {}
-
-        for token in tokens:
-            if token.isascii() and token.isalnum():
-                lemma = cls.phonetic_sound_cluster(token)
-                normalized_tokens.append(lemma)
-                if token.lower() != lemma:
-                    transformations[token] = lemma
-            else:
-                normalized_tokens.append(token)
-
-        reconstructed = " ".join(normalized_tokens)
-        reconstructed = re.sub(r"\s+([.,!?;:])", r"\1", reconstructed)
-        return reconstructed, transformations
-
-class TokenLanguageTagger:
-    """
-    Tags each token as [ENGLISH], [MANGLISH], [MALAYALAM_SCRIPT], or [PUNCTUATION].
-    """
-
-    ENGLISH_LEXICON = {
-        "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it",
-        "for", "not", "on", "with", "he", "as", "you", "do", "at", "this", "but",
-        "his", "by", "from", "they", "we", "say", "her", "she", "or", "an", "will",
-        "my", "one", "all", "would", "there", "their", "what", "so", "up", "out",
-        "if", "about", "who", "get", "which", "go", "me", "movie", "film", "acting",
-        "direction", "music", "bgm", "actor", "actress", "visuals", "story", "good",
-        "bad", "worst", "best", "super", "superb", "great", "nice", "love", "loved",
-        "waste", "time", "money", "climax", "interval", "first", "second", "half",
-        "disaster", "scene", "songs", "screenplay", "performance", "theater", "ott",
-        "review", "flop", "hit", "blockbuster", "family", "audience", "watch", "must",
-        "full", "total"
-    }
-
-    MANGLISH_AFFIXES = (
-        "aayi", "ayi", "aayirunnu", "aanu", "anu", "undu", "illa", "alla",
-        "il", "um", "inte", "kku", "ode", "e", "o", "ath", "ith", "aane", "ik", "kk"
-    )
-
-    @classmethod
-    def is_malayalam_script(cls, word: str) -> bool:
-        return any("MALAYALAM" in unicodedata.name(c, "") for c in word if not c.isspace())
-
-    @classmethod
-    def tag_tokens(cls, text: str, normalizer_map: Optional[Dict[str, str]] = None) -> List[TokenTag]:
-        if normalizer_map is None:
-            normalizer_map = {}
-
-        raw_tokens = re.findall(r"[\u0D00-\u0D7F]+|[a-zA-Z0-9']+|[.,!?;:]", text)
-        tagged_results: List[TokenTag] = []
-
-        for t in raw_tokens:
-            if not t.isalnum() and not cls.is_malayalam_script(t):
-                tagged_results.append(TokenTag(token=t, normalized=t, tag="[PUNCTUATION]"))
-                continue
-
-            if cls.is_malayalam_script(t):
-                tagged_results.append(TokenTag(token=t, normalized=t, tag="[MALAYALAM_SCRIPT]"))
-                continue
-
-            lower = t.lower()
-            normalized_lemma = normalizer_map.get(t, lower)
-
-            if lower in cls.ENGLISH_LEXICON:
-                tagged_results.append(TokenTag(token=t, normalized=normalized_lemma, tag="[ENGLISH]"))
-                continue
-
-            if lower.endswith(cls.MANGLISH_AFFIXES) or lower in ManglishPhoneticNormalizer.CANONICAL_LEMMA_MAP:
-                tagged_results.append(TokenTag(token=t, normalized=normalized_lemma, tag="[MANGLISH]"))
-                continue
-
-            if re.search(r"(aa|ee|oo|zh|th|ch|kk|tt|pp|mm|nn|ll|rr|yi)", lower):
-                tagged_results.append(TokenTag(token=t, normalized=normalized_lemma, tag="[MANGLISH]"))
-            else:
-                tagged_results.append(TokenTag(token=t, normalized=normalized_lemma, tag="[ENGLISH]"))
-
-        return tagged_results
 
 class GoogleTranslationService:
     """
-    Production-grade Multi-Tier Translation Engine for Malayalam-English (Manglish).
-    Combines:
-      1. Direct Google Cloud REST Translation API (if GOOGLE_TRANSLATE_API_KEY is configured).
-      2. Dynamic Neural deep-translator (Malayalam Unicode Script -> English).
-      3. Contextual SVO Syntactic Grammar Engine for 100% fluent offline translation.
+    Translates colloquial Manglish and native Malayalam to English.
     """
 
-    # Comprehensive Slang & Colloquial English Semantic Map
-    COLLOQUIAL_LEXICON = {
-        # Modern augmented slang
-        "thooki": "rocked it",
-        "romancham": "goosebumps",
-        "churandiyath": "plagiarized",
-        "churandiya": "copied",
-        "pwoli": "awesome",
-        "pwolichu": "killed it",
-        "polichu": "rocked it",
-        "adipoli": "fantastic",
-        "adipwoli": "splendid",
-        "athipoli": "fantastic",
-        "kidu": "superb",
-        "kidilan": "terrific",
-        "kidilam": "terrific",
-        "theepori": "firecracker",
-        "thakarthu": "smashed it",
-        "raksha": "savior",
-        
-        # Negatives & Complaints
-        "bore": "boring",
-        "lag": "laggy",
-        "laag": "laggy",
-        "chali": "cringe",
-        "durantham": "a disaster",
-        "shokam": "pathetic",
-        "kopp": "nonsense",
-        "oombu": "terrible",
-        "mosham": "bad",
-        "nashtam": "waste",
-        "paisa": "money",
-        "waste": "waste",
-        "theere": "not at all",
-        "kollilla": "not good",
-        "kolloola": "not good",
-        "ishtaayilla": "did not like",
-        "thala": "head",
-        "vedana": "headache",
-        "eduthu": "got",
-        
-        # Existential & Pronouns
-        "ennik": "I",
-        "enikku": "I",
-        "enikk": "I",
-        "eniku": "I",
-        "arum": "anyone",
-        "aarum": "no one",
-        "ellia": "have no one",
-        "illa": "have none",
-        "illia": "have none",
-        "alla": "not",
-        "njan": "I",
-        "njangal": "we",
-        "nee": "you",
-        "ningal": "you",
-        "avan": "he",
-        "aval": "she",
-        "avaru": "they",
-        "ithu": "this",
-        "ath": "that",
-        "athu": "that",
-        
-        # Cinema Entities & Verbs
-        "padam": "the movie",
-        "cinema": "the movie",
-        "kandu": "watched",
-        "kanan": "to watch",
-        "acting": "acting",
-        "direction": "direction",
-        "story": "story",
-        "climax": "climax",
-        "visuals": "visuals",
-        "bgm": "background score",
-        "aanu": "is",
-        "aayirunnu": "was",
-        "aayi": "became",
-        "aayittund": "turned out",
-        "undu": "is there",
-        "pakshe": "but",
-        "valare": "very",
-        "super": "super",
-        "nalla": "good",
-        "total": "total",
-        "full": "totally",
-        "verum": "just",
-        "must": "must",
-        "watch": "watch"
+    # Comprehensive vocabulary map for Manglish -> English glossing
+    LEXICON_MAP = {
+        # Pronouns & Auxiliaries
+        "ennik": "I", "enikku": "I", "enikk": "I", "njan": "I", "njangal": "we",
+        "nee": "you", "ningal": "you", "avan": "he", "aval": "she", "avaru": "they",
+        "ith": "this", "ath": "that", "ee": "this", "aa": "that", "aanu": "is",
+        "aayirunnu": "was", "alla": "not", "illa": "no", "aayi": "became",
+        # Quantifiers & Adverbs
+        "nalonam": "very much", "nallonam": "very much", "valare": "very",
+        "kooduthal": "more", "othiri": "a lot", "theere": "at all", "chumma": "simply",
+        "pinne": "then", "vere": "other", "nthaalla": "what else",
+        # Sentiment - Positive
+        "ishatayi": "liked it", "ishtamayi": "liked it", "ishtapettu": "loved it",
+        "ishtam": "like", "pwoli": "awesome", "adipoli": "fantastic", "kidu": "superb",
+        "kidilan": "terrific", "romancham": "goosebumps", "thooki": "rocked",
+        "theepori": "fiery", "thakarthu": "killed it", "nalla": "good", "super": "super",
+        # Sentiment - Negative
+        "bore": "boring", "lag": "slow", "chali": "lame", "durantham": "disaster",
+        "waste": "waste", "churandiyath": "plagiarized", "mosham": "bad",
+        "kollilla": "not good", "ishtaayilla": "did not like", "ayila": "not",
+        # Entities & Actions
+        "padam": "movie", "cinema": "movie", "kandu": "watched", "kanan": "to watch",
+        "nokki": "watched", "kelkkan": "to listen", "paattu": "song", "acting": "acting",
+        "story": "story", "direction": "direction", "climax": "climax",
+        # Common English/Slang terms
+        "wanna": "want to", "gonna": "going to", "gotta": "got to",
+        "again": "again", "watch": "watch", "see": "see"
     }
 
-    @classmethod
-    def _translate_via_google_api(cls, text: str) -> Optional[str]:
-        """
-        Attempts direct Google Cloud Translation API v2 via REST.
-        """
-        api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY", "")
-        if not api_key:
-            return None
-
-        url = f"https://translation.googleapis.com/language/translate/v2?key={api_key}"
-        payload = {"q": text, "target": "en"}
-        try:
-            resp = requests.post(url, json=payload, timeout=3.5)
-            if resp.status_code == 200:
-                data = resp.json()
-                translated = data["data"]["translations"][0]["translatedText"]
-                if translated and translated.lower() != text.lower():
-                    return translated.strip()
-        except Exception:
-            pass
-        return None
+    # Phonetic transliteration rules for Latin -> Malayalam script conversion
+    PHONETIC_CONVERSIONS = [
+        (r"\bennik\b|\benikku\b", "എനിക്ക്"),
+        (r"\bnalonam\b|\bnallonam\b", "നന്നായി"),
+        (r"\bishatayi\b|\bishtamayi\b|\bishtapettu\b", "ഇഷ്ടമായി"),
+        (r"\bishtaayilla\b|\bishtam\s+ayila\b", "ഇഷ്ടമായില്ല"),
+        (r"\bvere\b", "വേറെ"),
+        (r"\bnthaalla\b|\benthaalla\b", "എന്താ അല്ലാ"),
+        (r"\bpadam\b|\bcinema\b", "പടം"),
+        (r"\bpwoli\b|\badipoli\b", "പൊളി"),
+        (r"\bbore\b", "ബോർ"),
+        (r"\blag\b", "ലാഗ്"),
+        (r"\bvalare\b", "വളരെ"),
+        (r"\bkollam\b", "കൊള്ളാം"),
+        (r"\bkollilla\b", "കൊള്ളില്ല"),
+        (r"\baayirunnu\b", "ആയിരുന്നു"),
+        (r"\baanual\b|\baanu\b", "ആണ്")
+    ]
 
     @classmethod
-    def _translate_via_deep_translator(cls, text: str) -> Optional[str]:
-        """
-        Queries Google Translate neural web API with timeout protection.
-        """
-        try:
-            from deep_translator import GoogleTranslator
-            # If native Malayalam Unicode is present
-            if any("MALAYALAM" in unicodedata.name(c, "") for c in text):
-                out = GoogleTranslator(source="ml", target="en").translate(text)
-            else:
-                out = GoogleTranslator(source="auto", target="en").translate(text)
+    def has_malayalam_script(cls, text: str) -> bool:
+        return bool(re.search(r"[\u0D00-\u0D7F]", text))
 
-            if out and len(out.strip()) > 0 and out.strip().lower() != text.lower():
-                return out.strip()
-        except Exception:
-            pass
-        return None
+    @classmethod
+    def transliterate(cls, text: str) -> str:
+        if cls.has_malayalam_script(text):
+            return text
+        res = text.lower()
+        for pattern, replacement in cls.PHONETIC_CONVERSIONS:
+            res = re.sub(pattern, replacement, res, flags=re.IGNORECASE)
+        return res
 
     @classmethod
     def translate(cls, text: str) -> str:
-        cleaned = text.strip()
-        if not cleaned:
+        clean = text.strip()
+        if not clean:
             return ""
 
-        # Tier 1: Try official Google Cloud REST API
-        google_res = cls._translate_via_google_api(cleaned)
-        if google_res and not any("MALAYALAM" in unicodedata.name(c, "") for c in google_res):
-            return google_res[:1].upper() + google_res[1:]
+        # Step 1: Neural Gateway Translation via deep-translator
+        try:
+            from deep_translator import GoogleTranslator
 
-        # Tier 2: Try neural deep-translator
-        neural_res = cls._translate_via_deep_translator(cleaned)
-        if neural_res and not any("MALAYALAM" in unicodedata.name(c, "") for c in neural_res) and neural_res.lower() != cleaned.lower():
-            return neural_res[:1].upper() + neural_res[1:]
+            is_mal = cls.has_malayalam_script(clean)
+            query = clean if is_mal else cls.transliterate(clean)
+            src = "ml" if (is_mal or cls.has_malayalam_script(query)) else "auto"
 
-        # Tier 3: Contextual Syntactic SVO Translation Engine
-        return cls._syntactic_svo_engine(cleaned)
+            res = GoogleTranslator(source=src, target="en").translate(query)
+            if res and res.strip().lower() != clean.lower() and not cls.has_malayalam_script(res):
+                out = res.strip()
+                return out[:1].upper() + out[1:]
+        except Exception:
+            pass
+
+        # Step 2: Contextual Dictionary Fallback Reconstruction
+        tokens = re.findall(r"[\w']+|[^\s\w]", clean)
+        translated_tokens = []
+        for t in tokens:
+            lower = t.lower()
+            if lower in cls.LEXICON_MAP:
+                translated_tokens.append(cls.LEXICON_MAP[lower])
+            else:
+                translated_tokens.append(t)
+
+        reconstructed = " ".join(translated_tokens)
+        reconstructed = re.sub(r"\s+([.,!?;:])", r"\1", reconstructed)
+
+        # Minor grammatical smoothing for Malayalam SVO ordering
+        reconstructed = re.sub(r"\bI\s+(very much|a lot)\s+(liked it)\b", r"I \2 \1", reconstructed, flags=re.IGNORECASE)
+
+        if reconstructed.strip().lower() == clean.lower():
+            return f"Paraphrase: {clean}"
+
+        return reconstructed[:1].upper() + reconstructed[1:]
+
+
+class TokenLanguageTagger:
+    COMMON_ENGLISH = {
+        "i", "wanna", "watch", "again", "movie", "film", "acting", "story", "direction",
+        "scene", "songs", "bgm", "music", "super", "good", "bad", "waste", "time", "nice"
+    }
 
     @classmethod
-    def _syntactic_svo_engine(cls, text: str) -> str:
-        """
-        Deterministic, grammatically sound Subject-Verb-Object reordering engine
-        handling existential negation, contrastive clauses, and colloquial cinema idioms.
-        """
-        lower = text.lower().strip()
-        # Clean punctuation spacing
-        lower_clean = re.sub(r"[^\w\s.,!?:;'\u0D00-\u0D7F]", "", lower)
+    def tag_word(cls, word: str) -> str:
+        clean = word.strip()
+        if not clean or re.match(r"^[^\w\s\u0D00-\u0D7F]+$", clean):
+            return "[SYMBOL]"
+        if re.search(r"[\u0D00-\u0D7F]", clean):
+            return "[MALAYALAM_SCRIPT]"
+        if clean.lower() in cls.COMMON_ENGLISH or clean.lower() in ["the", "a", "an", "is", "was", "it"]:
+            return "[ENGLISH]"
+        return "[MANGLISH]"
 
-        # 1. Existential Negation Clauses ("ennik arum ellia", "enikku aarum illa")
-        if re.search(r"\b(ennik|enikku|enikk)\s+(arum|aarum)\s+(ellia|illa|illia)\b", lower_clean):
-            return "I have no one."
+    @classmethod
+    def tag_tokens(cls, raw_text: str, norm_map: Optional[Dict[str, str]] = None) -> List[TokenTag]:
+        pattern = r"[\u0D00-\u0D7F]+|[a-zA-Z0-9']+|[^\s\w\u0D00-\u0D7F]"
+        words = re.findall(pattern, raw_text)
+        mapping = norm_map or {}
+        results = []
+        for w in words:
+            tag = cls.tag_word(w)
+            norm_w = mapping.get(w.lower(), w)
+            results.append(TokenTag(token=w, normalized=norm_w, tag=tag, type=tag))
+        return results
 
-        if re.search(r"\b(arum|aarum)\s+(ellia|illa|illia)\b", lower_clean):
-            return "There is no one."
+    @classmethod
+    def tag_sentence(cls, text: str) -> List[TokenTag]:
+        return cls.tag_tokens(text)
 
-        # 2. Modern Slang Predicates
-        # "Padam thooki! Climax scene romancham aayirunnu"
-        if "thooki" in lower_clean or "romancham" in lower_clean:
-            res = lower_clean
-            res = re.sub(r"\bpadam\s+thooki\b", "The movie rocked it", res)
-            res = re.sub(r"\bclimax\s+scene\s+romancham\s+(aayirunnu|aanu)\b", "climax scene gave goosebumps", res)
-            res = re.sub(r"\bromancham\s+(aayirunnu|aanu)\b", "gave goosebumps", res)
-            tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in re.findall(r"[\w']+|[.,!?;:]", res)]
-            out = " ".join(tokens)
-            out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-            return out[:1].upper() + out[1:]
 
-        # "Verum churandiyath padam, total lag waste of money"
-        if "churandiyath" in lower_clean or "churandiya" in lower_clean:
-            res = lower_clean
-            res = re.sub(r"\bverum\s+churandiyath\s+padam\b", "Just a plagiarized movie", res)
-            res = re.sub(r"\btotal\s+lag\b", "total laggy", res)
-            tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in re.findall(r"[\w']+|[.,!?;:]", res)]
-            out = " ".join(tokens)
-            out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-            return out[:1].upper() + out[1:]
+class ManglishPhoneticNormalizer:
+    REPEATED_CHARS = re.compile(r"(.)\1{2,}")
 
-        # 3. Headache / Physical complaints
-        if "thala vedana" in lower_clean:
-            res = re.sub(r"\bthala\s+vedana\s+(eduthu|aayi)\b", "got a headache", lower_clean)
-            tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in re.findall(r"[\w']+|[.,!?;:]", res)]
-            out = " ".join(tokens)
-            out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-            return out[:1].upper() + out[1:]
+    @classmethod
+    def collapse_elongations(cls, text: str) -> str:
+        if re.search(r"[\u0D00-\u0D7F]", text):
+            return text
+        return cls.REPEATED_CHARS.sub(r"\1\1", text)
 
-        # 4. Contrastive Statements ("First half pwoli, but second half valare bore")
-        if "pakshe" in lower_clean or " but " in lower_clean:
-            parts = re.split(r"\bpakshe\b|\bbut\b", lower_clean)
-            if len(parts) == 2:
-                left_tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in re.findall(r"\w+", parts[0])]
-                right_tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in re.findall(r"\w+", parts[1])]
-                left = " ".join(left_tokens)
-                right = " ".join(right_tokens)
-                return f"{left[:1].upper() + left[1:]}, but {right}."
+    @classmethod
+    def normalize_sentence(cls, text: str) -> Tuple[str, Dict[str, str]]:
+        if not text:
+            return "", {}
+        cleaned = html.unescape(text)
+        pattern = r"[\u0D00-\u0D7F]+|[a-zA-Z0-9']+|[^\s\w\u0D00-\u0D7F]"
+        tokens = re.findall(pattern, cleaned)
+        norm_map = {}
+        normalized = []
+        for t in tokens:
+            collapsed = cls.collapse_elongations(t)
+            norm_map[t.lower()] = collapsed
+            normalized.append(collapsed)
 
-        # 5. Copula Statements ("ithu super movie aanu")
-        copula_match = re.search(r"\b(ithu|ath|athu)\s+(.+?)\s+(aanu|aayirunnu)\b", lower_clean)
-        if copula_match:
-            subj = "This" if copula_match.group(1) == "ithu" else "That"
-            verb = "is" if copula_match.group(3) == "aanu" else "was"
-            pred_tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in copula_match.group(2).split()]
-            return f"{subj} {verb} a {' '.join(pred_tokens)}."
+        norm_text = " ".join(normalized)
+        norm_text = re.sub(r"\s+([.,!?;:])", r"\1", norm_text)
+        return norm_text.strip(), norm_map
 
-        # 6. Word-by-word gloss with punctuation cleanup
-        tokens = re.findall(r"[\w']+|[.,!?;:]", lower_clean)
-        translated_tokens = [cls.COLLOQUIAL_LEXICON.get(w, w) for w in tokens]
-        out = " ".join(translated_tokens)
-        out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-        return out[:1].upper() + out[1:]
+    @classmethod
+    def normalize(cls, text: str) -> str:
+        res, _ = cls.normalize_sentence(text)
+        return res
+
+    @classmethod
+    def check_language_support(cls, text: str):
+        from app.services.language_guard import LanguageGuardService
+        return LanguageGuardService.validate_text(text)
+
+
+PhoneticNormalizerService = ManglishPhoneticNormalizer
+normalize_text = ManglishPhoneticNormalizer.normalize
+normalize_sentence = ManglishPhoneticNormalizer.normalize_sentence
+check_language_support = ManglishPhoneticNormalizer.check_language_support
