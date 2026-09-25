@@ -12,14 +12,17 @@ export default function App() {
   // Real analyzed comments returned by the backend
   const [analyzedBatch, setAnalyzedBatch] = useState([]);
   
-  // Real executive summary & global sentiment metrics
+  // Real macro distribution metrics
   const [batchMetrics, setBatchMetrics] = useState(null);
+
+  // Executive summary briefing from /api/generate-summary
+  const [summaryData, setSummaryData] = useState(null);
   
   // Loading & error state during batch processing
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState('');
 
-  // Primary Batch Pipeline: Sends scraped comments to backend /api/analyze-batch
+  // Primary Batch Pipeline: Sends scraped comments to backend /api/analyze-batch & /api/generate-summary
   const handleRunBatchInference = async (selectedComments) => {
     if (!selectedComments || selectedComments.length === 0) {
       alert("No comments selected for analysis.");
@@ -64,8 +67,8 @@ export default function App() {
         author: item.author,
         text: item.comment,
         cleaned_text: item.cleaned_comment,
-        translation: item.translated_text || item.comment, // Dynamic individual translation
-        sentiment: String(item.label).toUpperCase(),        // POSITIVE, NEGATIVE, NEUTRAL, MIXED
+        translation: item.translated_text || item.comment,
+        sentiment: String(item.label).toUpperCase(),
         confidence: Math.round(item.confidence),
         probabilities: item.probabilities,
         likes: item.like_count,
@@ -87,7 +90,26 @@ export default function App() {
         nss: data.net_sentiment_score
       });
 
-      // 5. Navigate to Analytics Tab
+      // 5. Generate Dynamic Executive Briefing via /api/generate-summary
+      try {
+        const summaryResponse = await fetch('http://127.0.0.1:8000/api/generate-summary', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify(data.comments)
+        });
+
+        if (summaryResponse.ok) {
+          const summaryJson = await summaryResponse.json();
+          setSummaryData(summaryJson);
+        }
+      } catch (sumErr) {
+        console.warn("Executive summary synthesis error:", sumErr);
+      }
+
+      // 6. Navigate to Analytics Tab
       setActiveTab('analytics');
 
     } catch (err) {
@@ -120,10 +142,11 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'analytics' && (
+        {(activeTab === 'analytics' || activeTab === 'intelligence') && (
           <AnalyticsTab 
             data={analyzedBatch} 
             metrics={batchMetrics} 
+            summary={summaryData}
             setActiveTab={setActiveTab} 
           />
         )}
