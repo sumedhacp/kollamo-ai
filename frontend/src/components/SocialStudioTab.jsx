@@ -3,10 +3,12 @@ import React, { useState } from 'react';
 
 export default function SocialStudio({ onAnalyze, setActiveTab }) {
   const [url, setUrl] = useState('https://www.youtube.com/watch?v=2hAfg4tjc-s');
-  const [limit, setLimit] = useState('50');
+  const [limitMode, setLimitMode] = useState('50');
+  const [customCount, setCustomCount] = useState(10);
   const [sortOrder, setSortOrder] = useState('top');
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState('');
+  const [fetchNotice, setFetchNotice] = useState('');
   const [detectedPlatform, setDetectedPlatform] = useState('YOUTUBE');
 
   // Initialized with realistic Code-Mixed Malayalam comments as starting baseline
@@ -19,7 +21,7 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
     { id: 'c_6', author: '@ott_updates', text: 'Ee movie OTT release date eppozhaanu?', likes: 15, date: '5d ago' },
     { id: 'c_7', author: '@rohan_sharma', text: 'यह फिल्म बहुत अच्छी है', likes: 8, date: '6d ago' }
   ]);
-  const [selectedIds, setSelectedIds] = useState(new Set(['c_1', 'c_2', 'c_3', 'c_4', 'c_5', 'c_6', 'c_7']));
+  const [selectedIds, setSelectedIds] = useState(new Set());
 
   // Auto-detect whether user pastes YouTube or Instagram link
   const handleUrlChange = (val) => {
@@ -35,6 +37,38 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
   };
 
   // Live Extraction Trigger calling FastAPI backend /api/scrape-comments
+    // Sort helper ensuring Top Liked, Newest, and Oldest sort accurately
+  const sortFeed = (items, order) => {
+    const parseTime = (str) => {
+      if (!str) return 0;
+      const s = str.toLowerCase().trim();
+      if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+        return new Date(s).getTime() || 0;
+      }
+      const numMatch = s.match(/(\d+)/);
+      const val = numMatch ? parseFloat(numMatch[1]) : 1;
+      const now = Date.now();
+      if (s.includes('sec')) return now - val * 1000;
+      if (s.includes('min')) return now - val * 60 * 1000;
+      if (s.includes('hour') || s.includes('hr')) return now - val * 3600 * 1000;
+      if (s.includes('day')) return now - val * 86400 * 1000;
+      if (s.includes('week')) return now - val * 7 * 86400 * 1000;
+      if (s.includes('month')) return now - val * 30 * 86400 * 1000;
+      if (s.includes('year')) return now - val * 365 * 86400 * 1000;
+      return now;
+    };
+
+    const copy = [...items];
+    if (order === 'top' || order === 'Top Liked') {
+      return copy.sort((a, b) => (b.likes || 0) - (a.likes || 0));
+    } else if (order === 'newest') {
+      return copy.sort((a, b) => parseTime(b.date) - parseTime(a.date));
+    } else if (order === 'oldest') {
+      return copy.sort((a, b) => parseTime(a.date) - parseTime(b.date));
+    }
+    return copy;
+  };
+
   const handleFetchFeed = async () => {
     if (!url.trim()) {
       setFetchError("Please paste a valid YouTube or Instagram URL.");
@@ -43,9 +77,17 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
 
     setLoading(true);
     setFetchError('');
+    setFetchNotice('');
+    // Reset state immediately so previous search results do not persist
+    setComments([]);
+    setSelectedIds(new Set());
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/scrape-comments', {
+      const targetLimit = limitMode === 'all' 
+        ? 0 
+        : (limitMode === 'custom' ? Math.max(1, parseInt(customCount, 10) || 1) : parseInt(limitMode, 10));
+
+      const response = await fetch('/api/scrape-comments', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -53,7 +95,7 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
         },
         body: JSON.stringify({
           url: url.trim(),
-          max_comments: parseInt(limit, 10),
+          max_comments: targetLimit,
           sort_order: sortOrder
         })
       });
@@ -65,36 +107,44 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
 
       const data = await response.json();
       const extractedList = data.comments || [];
+      const totalCount = extractedList.length;
 
-      if (extractedList.length === 0) {
-        setFetchError("No comments could be retrieved. Ensure comments are enabled on this post/video.");
+      if (totalCount === 0) {
+        setFetchError("No comments could be retrieved. Ensure comments are enabled and accessible on this post/video.");
+        setComments([]);
+        setSelectedIds(new Set());
         return;
       }
 
-      // Map backend CommentItem fields into the exact table structure
-      const formattedComments = extractedList.map((item, idx) => ({
-        id: item.comment_id || `comment_${idx}`,
+      const mapped = extractedList.map((item, index) => ({
+        id: item.comment_id ? `${item.comment_id}__${index}` : `comment_${index}`,
         author: item.author || '@anonymous',
         text: item.text || '',
-        likes: item.like_count ?? 0,
+        likes: Number(item.like_count) || 0,
         date: item.published_at || 'Recent'
       }));
 
-      setComments(formattedComments);
-      setDetectedPlatform(data.platform || detectedPlatform);
-      // Select all newly fetched items by default
-      setSelectedIds(new Set(formattedComments.map(c => c.id)));
+      // Sort with precision
+      const sortedComments = sortFeed(mapped, sortOrder);
+      setComments(sortedComments);
+      setSelectedIds(new Set());
 
+      if (targetLimit > 0 && totalCount < targetLimit) {
+        setFetchNotice(`Note: You requested ${targetLimit.toLocaleString()} comments, but this video only has ${totalCount.toLocaleString()} total comments available. Extracted all ${totalCount.toLocaleString()} comments.`);
+      } else if (targetLimit === 0) {
+        setFetchNotice(`Successfully extracted all ${totalCount.toLocaleString()} comments from this video.`);
+      }
     } catch (err) {
-      console.error("Live Feed Extraction Error:", err);
-      setFetchError(err.message || "Failed to reach scraping backend. Ensure uvicorn server is running on port 8000.");
+      setFetchError(err.message || "Failed to extract comments feed.");
     } finally {
       setLoading(false);
     }
   };
 
+  const isAllSelected = comments.length > 0 && selectedIds.size === comments.length;
+
   const toggleSelectAll = () => {
-    if (selectedIds.size === comments.length) {
+    if (isAllSelected) {
       setSelectedIds(new Set());
     } else {
       setSelectedIds(new Set(comments.map((c) => c.id)));
@@ -102,10 +152,15 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
   };
 
   const toggleOne = (id) => {
-    const next = new Set(selectedIds);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setSelectedIds(next);
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
   };
 
   const handleExecuteBatch = (mode) => {
@@ -166,11 +221,27 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
             <label style={{ display: 'block', fontSize: '0.6875rem', fontWeight: '700', marginBottom: '0.375rem', color: 'var(--text-subtle)' }}>
               LIMIT
             </label>
-            <select className="select-box" value={limit} onChange={(e) => setLimit(e.target.value)}>
-              <option value="20">First 20</option>
-              <option value="50">First 50</option>
-              <option value="100">First 100</option>
-            </select>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <select className="select-box" value={limitMode} onChange={(e) => setLimitMode(e.target.value)}>
+                <option value="50">First 50</option>
+                <option value="100">First 100</option>
+                <option value="200">First 200</option>
+                <option value="all">All</option>
+                <option value="custom">Custom</option>
+              </select>
+              {limitMode === 'custom' && (
+                <input
+                  type="number"
+                  min="1"
+                  max="3000"
+                  value={customCount}
+                  onChange={(e) => setCustomCount(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                  className="input-text"
+                  style={{ width: '80px', padding: '0.4rem 0.5rem', textAlign: 'center' }}
+                  title="Enter custom number of comments (e.g. 1, 2, 3...)"
+                />
+              )}
+            </div>
           </div>
 
           <div>
@@ -185,6 +256,7 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
             >
               <option value="top">Top Liked</option>
               <option value="newest">Newest</option>
+              <option value="oldest">Oldest</option>
             </select>
           </div>
 
@@ -198,6 +270,11 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
           </button>
         </div>
 
+        {fetchNotice && (
+          <div style={{ marginTop: '0.85rem', padding: '0.65rem 0.9rem', borderRadius: '8px', background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.25)', color: '#1d4ed8', fontSize: '0.8125rem', fontWeight: '500' }}>
+            ℹ️ {fetchNotice}
+          </div>
+        )}
         {fetchError && (
           <div style={{ marginTop: '0.85rem', color: '#b91c1c', fontSize: '0.8125rem', fontWeight: '600' }}>
             {fetchError}
@@ -224,7 +301,7 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
 
           <div style={{ display: 'flex', gap: '0.5rem' }}>
             <button className="btn btn-secondary" onClick={toggleSelectAll}>
-              {selectedIds.size === comments.length ? 'Deselect All' : 'Select All'}
+              {isAllSelected ? 'Deselect All' : 'Select All'}
             </button>
             <button className="btn btn-primary" onClick={() => handleExecuteBatch('selected')}>
               Analyze Selected ({selectedIds.size})
@@ -242,7 +319,7 @@ export default function SocialStudio({ onAnalyze, setActiveTab }) {
                 <th style={{ width: '40px', textAlign: 'center' }}>
                   <input
                     type="checkbox"
-                    checked={selectedIds.size === comments.length && comments.length > 0}
+                    checked={isAllSelected}
                     onChange={toggleSelectAll}
                   />
                 </th>
