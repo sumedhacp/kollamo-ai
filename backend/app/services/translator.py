@@ -132,3 +132,11 @@ class ManglishTranslatorService:
 
         # Step 3: Return original cleaned text if external engines are completely unreachable
         return cleaned
+
+    def translate(self, text: str) -> str:
+        """Instance alias to support services expecting translation_service.translate(text)."""
+        return self.translate_manglish_to_english(text)
+
+
+# Singleton instance expected by inference.py
+translation_service = ManglishTranslatorService()
