@@ -22,6 +22,7 @@ frontend/dist/
 # OS-specific files
 .DS_Store
 Thumbs.db
+<<<<<<< HEAD
 .tmp/
 ml/checkpoints/
 ml/data/
@@ -29,3 +30,7 @@ ml/data/
 
 .cache/
 
+=======
+
+.tmp/
+>>>>>>> origin/feature/milestone-6-audience-intelligence
