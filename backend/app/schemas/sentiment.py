@@ -1,15 +1,33 @@
+# backend/app/schemas/sentiment.py
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
+
+class TokenDetail(BaseModel):
+    token: str
+    normalized: str
+    type: str  # [ENGLISH], [MANGLISH], [MALAYALAM_SCRIPT], [PUNCTUATION]
+
+class SentimentSpan(BaseModel):
+    span_text: str
+    label: str
+    score: float
 
 class SingleTextRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="Raw Romanized Manglish or English text string")
+    text: str = Field(..., min_length=1, description="Raw social comment text")
 
 class SingleTextResponse(BaseModel):
     raw_text: str
     cleaned_text: str
-    label: str
+    is_supported: bool
+    language_type: str  # MALAYALAM, MANGLISH, ENGLISH, UNSUPPORTED
+    error_message: Optional[str] = None
+    translated_text: Optional[str] = None
+    token_breakdown: List[TokenDetail] = []
+    label: str  # Positive, Negative, Neutral, Mixed
     confidence: float
     probabilities: Dict[str, float]
+    is_mixed_sentiment: bool = False
+    conflicting_spans: List[SentimentSpan] = []
     latency_ms: float
 
 class BatchItemRequest(BaseModel):
@@ -29,12 +47,21 @@ class AnalyzedCommentItem(BaseModel):
     author: str
     like_count: int
     published_at: str
+    is_supported: bool
+    language_type: str
+    error_message: Optional[str] = None
+    translated_text: Optional[str] = None
+    token_breakdown: List[TokenDetail] = []
     label: str
     confidence: float
     probabilities: Dict[str, float]
+    is_mixed_sentiment: bool = False
+    conflicting_spans: List[SentimentSpan] = []
 
 class BatchAnalyzeResponse(BaseModel):
     total_analyzed: int
+    supported_count: int
+    unsupported_count: int
     sentiment_distribution: Dict[str, int]
     sentiment_percentages: Dict[str, float]
     net_sentiment_score: float
