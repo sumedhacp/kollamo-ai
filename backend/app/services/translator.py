@@ -1,197 +1,324 @@
+﻿from __future__ import annotations
+
+import functools
+import html
 import re
 import unicodedata
-from typing import List, Dict
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional, Tuple
+import requests
 
-class ManglishTranslatorService:
-    """
-    High-Coverage Hybrid Translation Engine for Romanized Malayalam (Manglish).
-    Features an expanded 120+ word colloquial lexicon, SOV -> SVO syntactic reordering,
-    and a fail-safe network translation layer that discards HTTP error payloads.
-    """
 
-    # Comprehensive Dravidian social media lexicon
-    MANGLISH_VOCAB = {
-        # Pronouns & Demonstratives
-        "ithu": "this", "ath": "that", "athu": "that", "ivan": "he", "ival": "she",
-        "avan": "he", "aval": "she", "avaru": "they", "njan": "I", "njangal": "we",
-        "nee": "you", "ningal": "you", "oru": "a", "valiya": "big",
+class LanguageKind(str, Enum):
+    MALAYALAM = "malayalam"
+    ENGLISH = "english"
+    MANGLISH = "manglish"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
 
-        # Common Nouns
-        "padam": "the movie", "cinema": "the movie", "story": "story",
-        "scene": "scene", "climax": "climax", "direction": "direction",
-        "visuals": "visuals", "bgm": "BGM", "acting": "acting", "paisa": "money",
-        "theatre": "theatre", "kallan": "thief", "mandan": "fool", "thallu": "hype",
 
-        # Sentiment Adjectives & Slang (Positive)
-        "kollam": "good", "nalla": "good", "valare": "very",
-        "adipoli": "fantastic", "adipwoli": "splendid", "pwoli": "awesome",
-        "polichu": "rocked", "pwolichu": "killed it", "kidu": "superb",
-        "kidilam": "terrific", "theepori": "firecracker", "raksha": "savior",
-        "thakarthu": "smashed it", "level": "top tier",
+@dataclass(frozen=True)
+class TranslationResult:
+    text: str
+    confidence: float
+    source_language: str
+    intermediate_malayalam: Optional[str]
+    method: str
 
-        # Sentiment Adjectives & Slang (Negative)
-        "bore": "boring", "oombu": "sucks", "lag": "laggy", "chali": "lame",
-        "durantham": "disaster", "nashtam": "waste", "mosham": "poor",
-        "veruppeer": "annoying", "thripthikaramalla": "unsatisfactory",
-        "shokam": "depressing", "cringe": "cringe", "oola": "garbage",
 
-        # Verbs, Tenses & Copulas
-        "aanu": "is", "aayirunnu": "was", "aayi": "became", "aayittund": "turned out",
-        "undu": "have", "illa": "no", "alla": "not", "kandu": "watched",
-        "kanan": "to watch", "kelkkan": "to hear", "parayan": "to say",
-        "ennu": "that", "vicharichu": "thought", "ishtapettu": "liked",
-        "veruthe": "wasted", "chumma": "simply", "poyi": "lost",
-        "chaththu": "died",
+class UnifiedTranslationEngine:
+    MALAYALAM_RE = re.compile(r"[\u0D00-\u0D7F]")
+    LATIN_RE = re.compile(r"[A-Za-z]")
+    LATIN_WORD_RE = re.compile(r"[a-zA-Z']+")
+    HTML_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
+    EMOJI_RE = re.compile(
+        r"[\U00010000-\U0010ffff\u2600-\u26ff\u2700-\u27bf\uFE00-\uFE0F\u200D]+",
+        flags=re.UNICODE,
+    )
 
-        # Question & Conjunction Words
-        "pakshe": "but", "eppozhaanu": "when is", "eppol": "when",
-        "entha": "what", "engane": "how", "evide": "where"
+    TRANSLIT_ENDPOINT = "https://inputtools.google.com/request"
+    TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+    REQUEST_TIMEOUT = 5.0
+
+    # Universal conversational Manglish phonetics & verbal contractions
+    PHONETIC_NORMALIZATIONS = (
+        # Convert colloquial dressing compound "ittu kandittundu" to literary participle "dharichu kandittundu"
+        (r"\bittu\s+(\w+)?kandattind\b|\bittu\s+(\w+)?kanditund\b", r"dharichu kandittundu"),
+        # Relative verbal past contractions: aara thanne -> aara thannathu (ആരാണ് തന്നത് - "who gave")
+        (r"\baara\s+thanne\b|\baaranu\s+thanne\b", "aara thannathu"),
+        # Ablative question markers: evidena / evidenna / evidunnu -> canonical "evide ninnaanu" ("from where")
+        (r"\bevidena\b|\bevidenna\b|\bevidunna\b|\bevidunnu\b", "evide ninnaanu"),
+        # Evaluative discourse interjection: map informal "kolam" / "kollam" directly to "കൊള്ളാം" (nice/good)
+        (r"^kolam\b|\bkolam\b|^kollam\b|\bkollam\b", "കൊള്ളാം"),
+        (r"\bayind\b|\baayind\b|\bayittind\b", "aayittundu"),
+        (r"\bcheythind\b|\bcheyind\b", "cheythittundu"),
+        (r"\bittind\b|\bitind\b", "ittittundu"),
+        (r"\b(\w+)attind\b", r"\1ittundu"),
+        (r"\b(\w+)atund\b", r"\1ittundu"),
+        (r"\b(\w+)itund\b", r"\1ittundu"),
+        (r"\b(\w+)indoo\b|\b(\w+)indo\b", r"\1undo"),
+        (r"\bindoo\b|\bindo\b|\bindu\b", "undo"),
+        (r"\bettirikunna\b|\bettirikkunna\b", "ittirikkunna"),
+        (r"\bcheyithirunnekil\b|\bcheythirunnekil\b", "cheythirunnenkil"),
+        (r"\bonnude\b|\bonnkoodi\b", "onnukoodi"),
+        (r"\bpolichenne\b|\bpolichelle\b", "adipoli aayene"),
+        (r"\bayappo\b|\bayapo\b", "aayappol"),
+    )
+
+    # Discourse marker regex: ensures interjections at the sentence opening have a strong clause separator
+    DISCOURSE_MARKER_RE = re.compile(
+        r"^(കൊള്ളാം|super|pwoli|adipoli|nice|kidilan|mass|wow)\s+([,\s]*)?(ith|itha|ithu|aara|aaranu|evide|evide\s+ninnaanu|engane|enth|entha|dress|look)\b",
+        re.IGNORECASE,
+    )
+
+    COMMON_ENGLISH_WORDS = {
+        "the", "be", "to", "of", "and", "a", "in", "that", "have", "i",
+        "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+        "this", "but", "his", "by", "from", "they", "we", "say", "her", "she",
+        "or", "an", "will", "my", "one", "all", "would", "there", "their",
+        "what", "so", "up", "out", "if", "about", "who", "get", "which", "go",
+        "me", "when", "make", "can", "like", "time", "no", "just", "him", "know",
+        "take", "people", "into", "year", "your", "good", "some", "could", "them",
+        "see", "other", "than", "then", "now", "look", "only", "come", "its", "over",
+        "think", "also", "back", "after", "use", "two", "how", "our", "work", "first",
+        "well", "way", "even", "new", "want", "because", "any", "these", "give", "day",
+        "most", "us", "is", "are", "was", "were", "been", "has", "had", "did", "does",
+        "styling", "point", "on", "superb", "loved", "dress", "watch", "link",
+        "agree", "with", "dear", "forgot", "mine", "missing", "feel", "wear",
+        "acting", "cinema", "movie", "song", "climax", "scene", "music", "bgm",
+        "bro", "brother", "sister", "nice", "great", "best", "worst", "bad", "love"
     }
 
-    ENGLISH_VOCAB = {
-        "the", "a", "an", "is", "was", "movie", "film", "acting", "scene",
-        "climax", "direction", "music", "song", "bgm", "actor", "actress",
-        "visuals", "story", "total", "disaster", "super", "hit", "blockbuster",
-        "flop", "waste", "of", "time", "money", "and", "but", "very", "good",
-        "bad", "worst", "best", "first", "second", "half", "interval",
-        "review", "teaser", "trailer", "release", "date", "family", "enjoy",
-        "watch", "loved", "liked", "nice", "great", "excellent"
-    }
+    def __init__(self, *, timeout: float = REQUEST_TIMEOUT):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,ml;q=0.8",
+        })
+
+    @staticmethod
+    def normalize(text: str) -> str:
+        if not text:
+            return ""
+        text = html.unescape(text)
+        text = unicodedata.normalize("NFC", text)
+        text = text.replace("\u200b", "").replace("\ufeff", "").replace("\u00a0", " ")
+        return re.sub(r"\s+", " ", text).strip()
 
     @classmethod
-    def get_token_breakdown(cls, text: str) -> List[Dict[str, str]]:
-        """
-        Classifies each word into: 'English', 'Phonetic Manglish', or 'Malayalam Script'.
-        """
-        tokens = re.findall(r"[\w']+|[.,!?;:]", text)
-        result = []
+    def extract_emojis(cls, text: str) -> Tuple[str, List[Tuple[int, str]]]:
+        emojis = []
+        for m in cls.EMOJI_RE.finditer(text):
+            emojis.append((m.start(), m.group()))
+        cleaned = cls.EMOJI_RE.sub(" ", text)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned, emojis
 
-        for token in tokens:
-            if not token.isalnum():
-                result.append({"token": token, "type": "PUNCTUATION"})
-                continue
-
-            if any("MALAYALAM" in unicodedata.name(c, "") for c in token):
-                result.append({"token": token, "type": "Malayalam Script"})
-                continue
-
-            lower_token = token.lower()
-            if lower_token in cls.ENGLISH_VOCAB:
-                result.append({"token": token, "type": "English"})
-            elif lower_token in cls.MANGLISH_VOCAB:
-                result.append({"token": token, "type": "Phonetic Manglish"})
-            else:
-                if re.search(r"(aayi|il|aanu|undu|illa|aayirunnu|ichu|ettu|um|o|e|tha)$", lower_token):
-                    result.append({"token": token, "type": "Phonetic Manglish"})
-                else:
-                    result.append({"token": token, "type": "English"})
-
+    @classmethod
+    def normalize_manglish_phonetics(cls, text: str) -> str:
+        result = text
+        for pattern, replacement in cls.PHONETIC_NORMALIZATIONS:
+            result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+        # Separate introductory interjections with an exclamation mark so MT never treats them as subject agents
+        result = cls.DISCOURSE_MARKER_RE.sub(r"\1! \3", result)
         return result
 
     @classmethod
-    def _local_syntactic_translate(cls, text: str) -> str:
-        """
-        Syntactic SOV -> SVO reordering engine providing reliable, grammatical translations.
-        """
-        lower = text.lower().strip()
-        lower = re.sub(r"\s+", " ", lower)
-
-        # Rule 1: Expectation vs Reality ('kollam ennu vicharichu, pakshe climax bore aayi')
-        contrast_match = re.search(r"(.+?)\s+ennu\s+vicharichu[,\s]+pakshe\s+(.+)", lower)
-        if contrast_match:
-            clause1 = contrast_match.group(1).strip()
-            clause2 = contrast_match.group(2).strip().rstrip(".!?,")
-
-            if "padam" in clause1:
-                quality = clause1.replace("padam", "").strip()
-                trans_quality = cls.MANGLISH_VOCAB.get(quality, quality)
-                clause1_trans = f"Thought the movie was {trans_quality}"
-            else:
-                words1 = [cls.MANGLISH_VOCAB.get(w, w) for w in clause1.split()]
-                clause1_trans = f"Thought {' '.join(words1)}"
-
-            if "bore aayi" in clause2:
-                subject = clause2.replace("bore aayi", "").strip()
-                clause2_trans = f"the {subject} became boring" if subject else "it became boring"
-            elif "aayi" in clause2:
-                words2 = clause2.replace("aayi", "").strip().split()
-                trans_words = [cls.MANGLISH_VOCAB.get(w, w) for w in words2]
-                clause2_trans = f"the {' '.join(trans_words)} became bad"
-            else:
-                words2 = [cls.MANGLISH_VOCAB.get(w, w) for w in clause2.split()]
-                clause2_trans = " ".join(words2)
-
-            return f"{clause1_trans}, but {clause2_trans}."
-
-        # Rule 2: Waste of money / time expressions ('chumma thallu padam aanu, veruthe paisa poyi')
-        if "paisa poyi" in lower or "waste of money" in lower:
-            parts = lower.split(",")
-            prefix = parts[0].strip()
-            prefix_words = [cls.MANGLISH_VOCAB.get(w, w) for w in prefix.split() if w not in ["aanu", "aayirunnu"]]
-            return f"It was just an overhyped movie, totally a waste of money."
-
-        # Rule 3: Character / person descriptor ('avan oru valiya mandan aayirunnu')
-        person_match = re.search(r"\b(avan|aval|ivan|eval)\s+oru\s+(.+?)\s+(aayirunnu|aanu)\b", lower)
-        if person_match:
-            pronoun = cls.MANGLISH_VOCAB.get(person_match.group(1), "He").capitalize()
-            tense = "was" if person_match.group(3) == "aayirunnu" else "is"
-            desc_words = person_match.group(2).split()
-            desc_trans = [cls.MANGLISH_VOCAB.get(w, w) for w in desc_words]
-            return f"{pronoun} {tense} a {' '.join(desc_trans)}."
-
-        # Rule 4: Copula Statements ('ithu super movie aanu')
-        copula_match = re.search(r"\b(ithu|ath|athu)\s+(.+?)\s+(aanu|aayirunnu)\b", lower)
-        if copula_match:
-            subj = "This" if copula_match.group(1) == "ithu" else "That"
-            verb = "is" if copula_match.group(3) == "aanu" else "was"
-            pred = copula_match.group(2).strip().split()
-            trans_pred = [cls.MANGLISH_VOCAB.get(w, w) for w in pred]
-            return f"{subj} {verb} a {' '.join(trans_pred)}."
-
-        # Rule 5: Aspectual Predicate ('padam kidu aayirunnu, visuals and bgm pwoli!')
-        padam_copula = re.search(r"\bpadam\s+(.+?)\s+(aayirunnu|aanu)\b", lower)
-        if padam_copula:
-            tense = "was" if padam_copula.group(2) == "aayirunnu" else "is"
-            quality = padam_copula.group(1).strip()
-            trans_quality = cls.MANGLISH_VOCAB.get(quality, quality)
-            trailing = lower[padam_copula.end():].strip().lstrip(",").strip()
-            out = f"The movie {tense} {trans_quality}"
-            if trailing:
-                tokens = re.findall(r"[\w']+|[.,!?;:]", trailing)
-                trans_tokens = [cls.MANGLISH_VOCAB.get(t, t) for t in tokens]
-                out += f", {' '.join(trans_tokens)}"
-            out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-            return out.capitalize()
-
-        # Fallback: Sequential dictionary translation with proper spacing
-        tokens = re.findall(r"[\w']+|[.,!?;:]", lower)
-        translated = [cls.MANGLISH_VOCAB.get(t, t) for t in tokens]
-        out = " ".join(translated)
-        out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-        return out.capitalize()
+    def is_malayalam_script(cls, text: str) -> bool:
+        return bool(text and cls.MALAYALAM_RE.search(text))
 
     @classmethod
-    def translate_manglish_to_english(cls, text: str) -> str:
-        """
-        Translates Manglish to English. Attempts deep-translator only if available
-        and strictly validates the response against HTML error patterns before returning.
-        """
-        cleaned = text.strip()
-        if not cleaned:
-            return ""
+    def is_latin_script(cls, text: str) -> bool:
+        return bool(text and cls.LATIN_RE.search(text))
 
-        # Attempt external translation with strict error rejection
+    @classmethod
+    def latin_words(cls, text: str) -> List[str]:
+        return [w.lower() for w in cls.LATIN_WORD_RE.findall(text)]
+
+    @classmethod
+    def classify(cls, text: str) -> LanguageKind:
+        has_ml = cls.is_malayalam_script(text)
+        words = cls.latin_words(text)
+        has_latin = bool(words)
+
+        if has_ml and has_latin:
+            return LanguageKind.MIXED
+        if has_ml:
+            return LanguageKind.MALAYALAM
+        if not has_latin:
+            return LanguageKind.UNKNOWN
+
+        total_words = len(words)
+        eng_matches = sum(1 for w in words if w in cls.COMMON_ENGLISH_WORDS)
+
+        if eng_matches == total_words:
+            return LanguageKind.ENGLISH
+
+        if total_words > 0 and (eng_matches / total_words) >= 0.65:
+            return LanguageKind.ENGLISH
+
+        return LanguageKind.MANGLISH
+
+    def transliterate_full_sentence(self, text: str) -> str:
+        canonical = self.normalize_manglish_phonetics(text)
+        params = {
+            "text": canonical,
+            "itc": "ml-t-i0-und",
+            "num": "1",
+            "cp": "0",
+            "cs": "1",
+            "ie": "utf-8",
+            "oe": "utf-8",
+        }
         try:
-            from deep_translator import GoogleTranslator
-            translator = GoogleTranslator(source='auto', target='en')
-            candidate = translator.translate(cleaned)
-            # Validate that the response is not an HTML error or empty
-            if candidate and "Error 500" not in candidate and "<html" not in candidate.lower() and len(candidate.strip()) > 0:
-                out = candidate.strip()
-                out = re.sub(r"\s+([.,!?;:])", r"\1", out)
-                return out[:1].upper() + out[1:]
+            resp = self.session.get(self.TRANSLIT_ENDPOINT, params=params, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) >= 2 and data[0] == "SUCCESS":
+                    segments = data[1]
+                    parts = []
+                    for seg in segments:
+                        if isinstance(seg, list) and len(seg) >= 2 and seg[1]:
+                            parts.append(seg[1][0])
+                    if parts:
+                        return " ".join(parts).strip()
+        except Exception:
+            pass
+        return canonical
+
+    def _cloud_translate(self, text: str, source: str = "auto", target: str = "en") -> Optional[str]:
+        if not text:
+            return None
+
+        # Strategy 1: Google dict-chrome-ex
+        try:
+            params = {
+                "client": "dict-chrome-ex",
+                "sl": source,
+                "tl": target,
+                "dt": "t",
+                "q": text,
+            }
+            resp = self.session.get(self.TRANSLATE_ENDPOINT, params=params, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data and isinstance(data[0], list):
+                    chunks = [p[0] for p in data[0] if isinstance(p, list) and p and isinstance(p[0], str)]
+                    res = "".join(chunks).strip()
+                    if res and not self.HTML_RE.search(res):
+                        return res
         except Exception:
             pass
 
-        # Use our local high-coverage syntactic engine
-        return cls._local_syntactic_translate(cleaned)
+        # Strategy 2: Google gtx
+        try:
+            params = {
+                "client": "gtx",
+                "sl": source,
+                "tl": target,
+                "dt": "t",
+                "q": text,
+            }
+            resp = self.session.get(self.TRANSLATE_ENDPOINT, params=params, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data and isinstance(data[0], list):
+                    chunks = [p[0] for p in data[0] if isinstance(p, list) and p and isinstance(p[0], str)]
+                    res = "".join(chunks).strip()
+                    if res and not self.HTML_RE.search(res):
+                        return res
+        except Exception:
+            pass
+
+        # Strategy 3: Deep Translator fallback
+        try:
+            from deep_translator import MyMemoryTranslator
+            src_lang = "malayalam" if source in {"ml", "malayalam"} else "auto"
+            translated = MyMemoryTranslator(source=src_lang, target=target).translate(text)
+            if translated and not self.HTML_RE.search(translated) and "MYMEMORY WARNING" not in translated.upper():
+                return translated.strip()
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def post_process_english_semantics(text: str) -> str:
+        cleaned = text
+        cleaned = re.sub(
+            r"\bseen\s+(this|it)\s+by\s+([^,.]+)",
+            r"seen \2 wearing \1",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\b([A-Z][a-zA-Z\s]+?)\s+has\s+seen\s+this\b",
+            r"Seen \1 wearing this",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned or "").strip()
+        return (cleaned[:1].upper() + cleaned[1:]) if cleaned else ""
+
+    def translate_detailed(self, text: str, source: str = "auto", target: str = "en") -> TranslationResult:
+        normalized_raw = self.normalize(text)
+        if not normalized_raw:
+            return TranslationResult("", 1.0, "unknown", None, "empty")
+
+        core_text, emojis = self.extract_emojis(normalized_raw)
+        emoji_suffix = " " + " ".join(e[1] for e in emojis) if emojis else ""
+
+        if not core_text and emojis:
+            return TranslationResult(normalized_raw, 1.0, "emoji", None, "emoji_pass")
+
+        kind = self.classify(core_text)
+
+        # 1. Pure English comments -> Unchanged
+        if kind == LanguageKind.ENGLISH:
+            return TranslationResult(normalized_raw, 0.99, "english", None, "english_invariant")
+
+        # 2. Pure Malayalam Script
+        if kind == LanguageKind.MALAYALAM or (self.is_malayalam_script(core_text) and not self.is_latin_script(core_text)):
+            translated = self._cloud_translate(core_text, source="ml", target="en")
+            if translated:
+                final_text = (self.post_process_english_semantics(translated) + emoji_suffix).strip()
+                return TranslationResult(final_text, 0.95, "malayalam", core_text, "ml->en")
+
+        # 3. Manglish or Mixed Code
+        transliterated_ml = self.transliterate_full_sentence(core_text)
+        translated = self._cloud_translate(transliterated_ml, source="ml", target="en")
+        if translated and translated.strip().lower() != core_text.strip().lower():
+            final_text = (self.post_process_english_semantics(translated) + emoji_suffix).strip()
+            return TranslationResult(
+                final_text,
+                0.90,
+                "manglish" if kind == LanguageKind.MANGLISH else "mixed",
+                transliterated_ml,
+                "manglish->ml->en",
+            )
+
+        # 4. Direct Cloud Translation fallback
+        direct = self._cloud_translate(core_text, source="auto", target="en")
+        if direct and direct.strip().lower() != core_text.strip().lower():
+            final_text = (self.post_process_english_semantics(direct) + emoji_suffix).strip()
+            return TranslationResult(
+                final_text,
+                0.85,
+                kind.value,
+                transliterated_ml,
+                "direct->en",
+            )
+
+        return TranslationResult(normalized_raw, 0.20, kind.value, transliterated_ml, "fallback")
+
+    def translate(self, text: str, source: str = "auto", target: str = "en") -> str:
+        return self.translate_detailed(text, source=source, target=target).text
+
+
+translation_service = UnifiedTranslationEngine()
