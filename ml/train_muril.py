@@ -16,7 +16,10 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.utils.class_weight import compute_class_weight
 
 os.environ["HF_HOME"] = r"D:\Projects\kollamo-ai\.cache\huggingface"
-os.environ["HF_TOKEN"] = "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"
+# Load token from environment variable or .env if present, otherwise ignore
+if "HF_TOKEN" not in os.environ and os.path.exists(".env"):
+    from dotenv import load_dotenv
+    load_dotenv()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 torch.set_num_threads(os.cpu_count() or 4)
