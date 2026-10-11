@@ -1,0 +1,33 @@
+# Virtual Environment & OS
+venv/
+.env
+.DS_Store
+Thumbs.db
+
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model Weights, Tensors & Checkpoints
+*.safetensors
+*.bin
+*.pt
+*.pth
+**/checkpoints/
+ml/saved_model/
+!ml/saved_model/.gitkeep
+
+# Datasets & Processed Splits
+ml/dataset/*.tsv
+ml/dataset/*.csv
+!ml/dataset/.gitkeep
+!ml/dataset/manglish_lexicon.json
+ml/data/
+*.parquet
+
+# Caches and Logging
+runs/
+wandb/
+.cache/
+hf_cache/

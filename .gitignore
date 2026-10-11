@@ -27,6 +27,7 @@ Thumbs.db
 ml/checkpoints/
 ml/data/
 
+<<<<<<< HEAD
 
 .cache/
 
@@ -34,3 +35,8 @@ ml/data/
 
 .tmp/
 >>>>>>> origin/feature/milestone-6-audience-intelligence
+=======
+.tmp/
+.cache/
+
+>>>>>>> origin/feature/nlp-muril-finetuning

@@ -1,62 +1,102 @@
 # ml/download_dataset.py
 import os
+import glob
 import pandas as pd
-from datasets import load_dataset
+from sklearn.model_selection import train_test_split
 
-def download_and_consolidate_dataset():
-    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset")
-    os.makedirs(output_dir, exist_ok=True)
-    target_csv = os.path.join(output_dir, "dravidian_manglish_sentiment.csv")
+# Label standard mapping for 3-class sentiment model:
+# 0: Positive, 1: Negative, 2: Neutral
+LABEL_MAP = {
+    "positive": "Positive",
+    "negative": "Negative",
+    "neutral": "Neutral",
+    "unknown_state": "Neutral",
+    "mixed_feelings": "Neutral"  # Merged into Neutral for 3-class base training
+}
 
-    print("[*] Connecting to Hugging Face Hub for 'tamilnlp/dravidian_codemix' (Malayalam)...")
+def process_tsv():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    dataset_dir = os.path.join(base_dir, "dataset")
+    target_csv = os.path.join(dataset_dir, "dravidian_manglish_sentiment.csv")
 
-    try:
-        dataset = load_dataset("tamilnlp/dravidian_codemix", "malayalam")
-        records = []
+    tsv_files = glob.glob(os.path.join(dataset_dir, "*sentiment*.tsv"))
+    if not tsv_files:
+        tsv_files = glob.glob(os.path.join(dataset_dir, "*.tsv"))
 
-        for split in ["train", "validation", "test"]:
-            if split in dataset:
-                print(f"[*] Extracting split '{split}' ({len(dataset[split])} rows)...")
-                for item in dataset[split]:
-                    text = str(item.get("text", "")).strip()
-                    label = str(item.get("label", "")).strip()
-                    if text:
-                        records.append({
-                            "split": split,
-                            "text": text,
-                            "label": label
-                        })
+    if not tsv_files:
+        print("[!] No TSV file found in ml/dataset/")
+        return
 
-        df = pd.DataFrame(records)
-        df.to_csv(target_csv, index=False, encoding="utf-8")
-        print(f"[SUCCESS] Downloaded {len(df)} DravidianCodeMix records to:\n          {target_csv}")
+    filepath = tsv_files[0]
+    print(f"[*] Ingesting: {os.path.basename(filepath)}")
 
-    except Exception as e:
-        print(f"[!] Hugging Face direct streaming error: {e}")
-        print("[*] Generating verified benchmark seed corpus with actual FIRE annotations...")
-        
-        benchmark_seeds = [
-            ("train", "Padam adipoli aayittund! Acting super visuals pwolichu 🔥🔥", "Positive"),
-            ("train", "Valare bore aayi poyi, second half total lag waste of money 💩", "Negative"),
-            ("train", "Ee movie release date eppozhaanu OTT varumo?", "Neutral"),
-            ("train", "First half pwoli, but second half valare bore", "Mixed_feelings"),
-            ("train", "ithu super movie aanu", "Positive"),
-            ("train", "ennik bad ayi", "Negative"),
-            ("train", "ennik arum ellia", "Negative"),
-            ("train", "Padam kollam ennu vicharichu, pakshe climax bore aayi", "Negative"),
-            ("train", "Kidu acting by Tovino visuals vere level", "Positive"),
-            ("train", "Paisa poyi veruthe oru chali padam", "Negative"),
-            ("train", "Trailer cut super aayirunnu, cinema kandilla", "Neutral"),
-            ("train", "BGM polichadukki visuals mass item", "Positive"),
-            ("validation", "Ithrem oola padam njan ithuvare kanditilla", "Negative"),
-            ("validation", "Direction thakarthu super screenplay", "Positive"),
-            ("test", "Average experience oru thavana kaanam", "Neutral"),
-            ("test", "Aadujeevitham vere level performance kidilam", "Positive")
-        ]
-        
-        df = pd.DataFrame(benchmark_seeds, columns=["split", "text", "label"])
-        df.to_csv(target_csv, index=False, encoding="utf-8")
-        print(f"[FALLBACK] Compiled verified DravidianCodeMix baseline ({len(df)} rows) at:\n           {target_csv}")
+    records = []
+    skipped_not_ml = 0
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t", 1)
+            if len(parts) == 2:
+                raw_label = parts[0].strip().lower()
+                text = parts[1].strip()
+
+                if raw_label == "not-malayalam":
+                    skipped_not_ml += 1
+                    continue
+
+                if raw_label in LABEL_MAP and len(text) > 1:
+                    records.append({
+                        "text": text,
+                        "label": LABEL_MAP[raw_label]
+                    })
+
+    df = pd.DataFrame(records)
+    print(f"[+] Extracted {len(df)} sentiment records (Filtered out {skipped_not_ml} 'not-malayalam' rows).")
+
+    # Drop duplicate text rows
+    df = df.drop_duplicates(subset=["text"]).reset_index(drop=True)
+    print(f"[+] Unique comments after deduplication: {len(df)}")
+    print("\nClass Distribution:")
+    print(df["label"].value_counts())
+
+    # Stratified Train (80%), Validation (10%), Test (10%)
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=0.2,
+        random_state=42,
+        stratify=df["label"]
+    )
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=0.5,
+        random_state=42,
+        stratify=temp_df["label"]
+    )
+
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+
+    train_df["split"] = "train"
+    val_df["split"] = "validation"
+    test_df["split"] = "test"
+
+    final_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+    final_df = final_df[["split", "text", "label"]]
+    final_df.to_csv(target_csv, index=False, encoding="utf-8")
+
+    # Save individual parquet files for fast PyTorch DataLoader streaming
+    processed_dir = os.path.join(base_dir, "data", "processed")
+    os.makedirs(processed_dir, exist_ok=True)
+    train_df.to_parquet(os.path.join(processed_dir, "train.parquet"), index=False)
+    val_df.to_parquet(os.path.join(processed_dir, "validation.parquet"), index=False)
+    test_df.to_parquet(os.path.join(processed_dir, "test.parquet"), index=False)
+
+    print(f"\n[SUCCESS] Datasets compiled and saved to:")
+    print(f"  -> {target_csv}")
+    print(f"  -> {processed_dir}\\train.parquet ({len(train_df)} rows)")
+    print(f"  -> {processed_dir}\\validation.parquet ({len(val_df)} rows)")
+    print(f"  -> {processed_dir}\\test.parquet ({len(test_df)} rows)")
 
 if __name__ == "__main__":
-    download_and_consolidate_dataset()
+    process_tsv()
