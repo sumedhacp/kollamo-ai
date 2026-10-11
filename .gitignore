@@ -22,3 +22,7 @@ frontend/dist/
 # OS-specific files
 .DS_Store
 Thumbs.db
+.tmp/
+ml/checkpoints/
+ml/data/
+
