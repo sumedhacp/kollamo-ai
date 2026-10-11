@@ -12,13 +12,14 @@ class CommentItem(BaseModel):
     platform: str
 
 class ScrapeRequest(BaseModel):
-    url: HttpUrl = Field(..., description="Public social media URL (YouTube, Instagram, X/Twitter)")
-    max_comments: int = Field(default=50, ge=1, le=200, description="Volume filter: 20, 50, 100")
-    sort_order: str = Field(default="top", description="'top' (Most Liked) or 'newest' (Latest)")
+    url: HttpUrl = Field(..., description="Public social media URL")
+    max_comments: int = Field(default=50, ge=0, description="0 for ALL comments, or any positive number (1, 2, 3...)")
+    sort_order: str = Field(default="top", description="'top', 'newest', or 'oldest'")
 
 class ScrapeResponse(BaseModel):
     platform: str
     media_id: str
     total_extracted: int
+    requested_limit: int = 0
     sort_order: str
     comments: List[CommentItem]
