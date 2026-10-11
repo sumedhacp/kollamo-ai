@@ -1,20 +1,14 @@
-# backend/app/services/scraper.py
+﻿from __future__ import annotations
+
 import os
 import re
 import html
-import urllib.parse
+import unicodedata
+import socket
+from typing import List, Optional, Tuple
 import requests
-from typing import List, Tuple, Optional
-from itertools import islice
-from dotenv import load_dotenv
 
 from app.schemas.scraper import CommentItem
-
-# Optional imports handled gracefully
-try:
-    from youtube_comment_downloader import YoutubeCommentDownloader, SORT_BY_POPULAR, SORT_BY_RECENT
-except ImportError:
-    YoutubeCommentDownloader = None
 
 try:
     from googleapiclient.discovery import build
@@ -22,277 +16,405 @@ except ImportError:
     build = None
 
 try:
-    import instaloader
+    from youtube_comment_downloader import YoutubeCommentDownloader, SORT_BY_POPULAR, SORT_BY_RECENT
 except ImportError:
-    instaloader = None
+    YoutubeCommentDownloader = None
+    SORT_BY_POPULAR = 0
+    SORT_BY_RECENT = 1
 
-# Ensure environment variables are loaded directly from the backend root
-env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
-load_dotenv(dotenv_path=env_path)
 
 class SocialScraperService:
-    """
-    Production-grade multi-platform scraper for YouTube and Instagram.
-    Extracts authentic live comments with unique IDs, user handles, and metrics
-    while strictly filtering out DOM UI buttons, banners, and Mojibake encoding artifacts.
-    """
-
     UI_ARTIFACT_BLACKLIST = {
-        "subscribe", "subscribed", "unsubscribe", "reply", "replies", "share",
-        "download", "clip", "save", "report", "like", "dislike", "720p", "1080p",
-        "480p", "360p", "240p", "auto", "speed", "quality", "subtitles", "cc",
-        "settings", "theatre mode", "full screen", "play", "pause", "mute",
-        "comments", "view all", "posts", "follow", "following", "translate",
-        "verified", "view replies", "hide replies", "listen on the web player",
-        "you can enjoy youtube music", "sony music malayalam", "muzika247",
-        "manorama music", "saina music", "millennium audios", "unsubscribe from"
+        "reply", "replies", "view replies", "view more replies",
+        "hide replies", "translate", "see original", "translate to english",
+        "verified", "edited", "share", "like", "dislike", "report",
+        "load more comments", "show more", "show less"
     }
+
+    @staticmethod
+    def clean_unicode_text(text: str) -> str:
+        if not text:
+            return ""
+        text = html.unescape(text)
+        text = unicodedata.normalize("NFC", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"https?://\S+|www\.\S+", "", text)
+        text = text.replace("\u200b", "").replace("\ufeff", "").replace("\u00a0", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
     @classmethod
     def is_ui_artifact(cls, text: str) -> bool:
-        clean = text.strip().lower()
-        if len(clean) < 3:
+        norm = text.lower().strip()
+        if not norm:
             return True
-        for artifact in cls.UI_ARTIFACT_BLACKLIST:
-            if artifact in clean:
-                return True
-        if re.match(r"^(\d{3,4}p|auto|\d+\s*fps|\d+:\d+|\d+k\s*views|\d+w|\d+d|\d+h|\d+m)$", clean):
+        if norm in cls.UI_ARTIFACT_BLACKLIST:
             return True
-        if "listen on the web player" in clean or "unsubscribe from" in clean:
+        if re.fullmatch(r"^\d+\s+(replies|reply|likes|like|views|comments)$", norm):
+            return True
+        if re.fullmatch(r"^(view|hide)\s+\d+\s+(more\s+)?(replies|reply)$", norm):
             return True
         return False
 
-    @classmethod
-    def clean_unicode_text(cls, raw: str) -> str:
-        """
-        Fixes Mojibake encoding corruption and unescapes HTML entities.
-        Ensures native Malayalam script (0x0D00-0x0D7F) displays properly.
-        """
-        if not raw:
-            return ""
-        
-        decoded = html.unescape(raw)
-
-        if any(c in decoded for c in ["à´", "àµ", "â", "ð"]):
-            try:
-                decoded = decoded.encode("latin-1").decode("utf-8")
-            except Exception:
-                pass
-
-        decoded = re.sub(r"\s+", " ", decoded).strip()
-        return decoded
-
     @staticmethod
     def identify_platform(url: str) -> str:
-        url_lower = str(url).lower()
+        url_lower = url.lower()
         if "youtube.com" in url_lower or "youtu.be" in url_lower:
             return "YOUTUBE"
-        if "instagram.com" in url_lower or "instagr.am" in url_lower:
+        if "instagram.com" in url_lower:
             return "INSTAGRAM"
         return "UNKNOWN"
 
     @staticmethod
     def extract_youtube_video_id(url: str) -> Optional[str]:
-        clean_url = str(url).strip()
-        parsed = urllib.parse.urlparse(clean_url)
-        if parsed.hostname in ["www.youtube.com", "youtube.com", "m.youtube.com"]:
-            queries = urllib.parse.parse_qs(parsed.query)
-            if "v" in queries and len(queries["v"][0]) == 11:
-                return queries["v"][0]
-
         patterns = [
-            r"(?:youtu\.be\/|shorts\/|embed\/|v\/|11\/)([a-zA-Z0-9_-]{11})",
-            r"^([a-zA-Z0-9_-]{11})$"
+            r"youtu\.be/([a-zA-Z0-9_-]{11})",
+            r"youtube\.com/shorts/([a-zA-Z0-9_-]{11})",
+            r"youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})",
+            r"youtube\.com/embed/([a-zA-Z0-9_-]{11})",
+            r"youtube\.com/v/([a-zA-Z0-9_-]{11})"
         ]
         for p in patterns:
-            m = re.search(p, clean_url)
-            if m:
-                return m.group(1)
+            match = re.search(p, url)
+            if match:
+                return match.group(1)
         return None
 
     @staticmethod
     def extract_instagram_shortcode(url: str) -> Optional[str]:
-        clean_url = str(url).strip()
-        m = re.search(r"/(?:p|reel|reels)/([a-zA-Z0-9_-]+)", clean_url)
-        if m:
-            return m.group(1)
+        patterns = [
+            r"instagram\.com/reel/([a-zA-Z0-9_-]+)",
+            r"instagram\.com/p/([a-zA-Z0-9_-]+)"
+        ]
+        for p in patterns:
+            match = re.search(p, url)
+            if match:
+                return match.group(1)
         return None
 
-    # ==========================================
-    # YOUTUBE DATA API V3 INGESTION (OFFICIAL)
-    # ==========================================
+    @staticmethod
+    def parse_time_to_seconds(time_str: str) -> int:
+        s = (time_str or "").lower().strip()
+        now_secs = 1000000000
+        match = re.search(r"(\d+)\s*(sec|second|min|minute|hour|hr|day|week|month|year)", s)
+        if not match:
+            return 0
+        val = int(match.group(1))
+        unit = match.group(2)
+        if "sec" in unit:
+            return now_secs - val
+        elif "min" in unit:
+            return now_secs - (val * 60)
+        elif "hour" in unit or "hr" in unit:
+            return now_secs - (val * 3600)
+        elif "day" in unit:
+            return now_secs - (val * 86400)
+        elif "week" in unit:
+            return now_secs - (val * 604800)
+        elif "month" in unit:
+            return now_secs - (val * 2592000)
+        elif "year" in unit:
+            return now_secs - (val * 31536000)
+        return 0
+
+    @classmethod
+    def sort_comment_items(cls, items: List[CommentItem], sort_order: str) -> List[CommentItem]:
+        order = sort_order.lower().strip()
+        if order in ["top", "top liked", "popular"]:
+            return sorted(items, key=lambda x: x.like_count, reverse=True)
+        elif order in ["newest", "recent"]:
+            return sorted(items, key=lambda x: cls.parse_time_to_seconds(x.published_at), reverse=True)
+        elif order in ["oldest"]:
+            return sorted(items, key=lambda x: cls.parse_time_to_seconds(x.published_at), reverse=False)
+        return items
+
     @classmethod
     def fetch_youtube_api(
         cls, api_key: str, video_id: str, max_comments: int = 50, sort_order: str = "top"
     ) -> List[CommentItem]:
         if not build:
             return []
-        youtube = build("youtube", "v3", developerKey=api_key)
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(12.0)
         comments: List[CommentItem] = []
-        order_param = "relevance" if sort_order == "top" or sort_order == "Top Liked" else "time"
+        try:
+            youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
+            order_param = "relevance" if sort_order in ["top", "Top Liked"] else "time"
+            page_size = 100 if max_comments <= 0 else min(max_comments, 100)
 
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=min(max_comments, 100),
-            textFormat="plainText",
-            order=order_param
-        )
+            request = youtube.commentThreads().list(
+                part="snippet",
+                videoId=video_id,
+                maxResults=page_size,
+                textFormat="plainText",
+                order=order_param
+            )
 
-        while request and len(comments) < max_comments:
-            response = request.execute()
-            for item in response.get("items", []):
-                snippet = item["snippet"]["topLevelComment"]["snippet"]
-                raw_comment = snippet.get("textDisplay", "")
-                cleaned_text = cls.clean_unicode_text(raw_comment)
+            while request:
+                response = request.execute()
+                for item in response.get("items", []):
+                    snippet = item["snippet"]["topLevelComment"]["snippet"]
+                    raw_comment = snippet.get("textDisplay", "")
+                    cleaned_text = cls.clean_unicode_text(raw_comment)
 
-                if cls.is_ui_artifact(cleaned_text):
-                    continue
+                    if cls.is_ui_artifact(cleaned_text):
+                        continue
 
-                comments.append(
-                    CommentItem(
-                        comment_id=item.get("id", f"yt_{video_id}_{len(comments)+1}"),
-                        text=cleaned_text,
-                        author=snippet.get("authorDisplayName", "@user"),
-                        author_avatar=snippet.get("authorProfileImageUrl", None),
-                        like_count=int(snippet.get("likeCount", 0)),
-                        published_at=str(snippet.get("publishedAt", "Recent"))[:10],
-                        platform="YOUTUBE"
+                    comments.append(
+                        CommentItem(
+                            comment_id=item.get("id", f"yt_{video_id}_{len(comments)+1}"),
+                            text=cleaned_text,
+                            author=snippet.get("authorDisplayName", "@user"),
+                            author_avatar=snippet.get("authorProfileImageUrl", None),
+                            like_count=int(snippet.get("likeCount", 0)),
+                            published_at=str(snippet.get("publishedAt", "Recent"))[:10],
+                            platform="YOUTUBE"
+                        )
                     )
-                )
-                if len(comments) >= max_comments:
+                    if max_comments > 0 and len(comments) >= max_comments:
+                        break
+
+                if max_comments > 0 and len(comments) >= max_comments:
                     break
-            request = youtube.commentThreads().list_next(request, response)
 
-        return comments
+                request = youtube.commentThreads().list_next(request, response)
+        except Exception as e:
+            print(f"[*] YouTube Official API failed/timed out: {e}")
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
-    # ==========================================
-    # YOUTUBE PUBLIC LIVE INGESTION (KEYLESS ENGINE)
-    # ==========================================
+        if comments:
+            return cls.sort_comment_items(comments, sort_order)
+        return []
+
+    @classmethod
+    def fetch_youtube_innertube_stream(cls, video_id: str, max_comments: int = 0) -> List[CommentItem]:
+        """Dynamic keyless stream extraction via YouTube Innertube ANDROID client (bypasses web HTML blocks)."""
+        items: List[CommentItem] = []
+        try:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 14; en_US; Pixel 8)",
+                "Content-Type": "application/json",
+            })
+
+            init_payload = {
+                "context": {
+                    "client": {
+                        "clientName": "ANDROID",
+                        "clientVersion": "19.09.37",
+                        "hl": "en",
+                        "gl": "US",
+                    }
+                },
+                "videoId": video_id
+            }
+
+            resp = session.post("https://www.youtube.com/youtubei/v1/next", json=init_payload, timeout=8.0)
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+
+            def find_token(obj):
+                if isinstance(obj, dict):
+                    if "continuationCommand" in obj:
+                        return obj["continuationCommand"].get("token")
+                    for v in obj.values():
+                        res = find_token(v)
+                        if res:
+                            return res
+                elif isinstance(obj, list):
+                    for item in obj:
+                        res = find_token(item)
+                        if res:
+                            return res
+                return None
+
+            continuation_token = find_token(data)
+
+            page_count = 0
+            while continuation_token and (max_comments <= 0 or len(items) < max_comments) and page_count < 30:
+                page_count += 1
+                cont_payload = {
+                    "context": {
+                        "client": {
+                            "clientName": "ANDROID",
+                            "clientVersion": "19.09.37",
+                            "hl": "en",
+                            "gl": "US",
+                        }
+                    },
+                    "continuation": continuation_token
+                }
+                c_resp = session.post("https://www.youtube.com/youtubei/v1/next", json=cont_payload, timeout=8.0)
+                if c_resp.status_code != 200:
+                    break
+                c_data = c_resp.json()
+
+                def extract_threads(obj):
+                    threads = []
+                    if isinstance(obj, dict):
+                        if "commentRenderer" in obj:
+                            threads.append(obj["commentRenderer"])
+                        for v in obj.values():
+                            threads.extend(extract_threads(v))
+                    elif isinstance(obj, list):
+                        for el in obj:
+                            threads.extend(extract_threads(el))
+                    return threads
+
+                renderers = extract_threads(c_data)
+                if not renderers:
+                    break
+
+                for r in renderers:
+                    content_runs = r.get("contentText", {}).get("runs", [])
+                    raw_text = "".join(run.get("text", "") for run in content_runs) or r.get("contentText", {}).get("simpleText", "")
+                    cleaned = cls.clean_unicode_text(raw_text)
+                    if not cleaned or cls.is_ui_artifact(cleaned):
+                        continue
+
+                    author = r.get("authorText", {}).get("simpleText", "@user")
+                    vote_count = r.get("voteCount", {}).get("simpleText", "0")
+                    like_num = 0
+                    if vote_count:
+                        try:
+                            vote_clean = str(vote_count).replace(",", "").strip()
+                            if "K" in vote_clean.upper():
+                                like_num = int(float(vote_clean.upper().replace("K", "")) * 1000)
+                            elif "M" in vote_clean.upper():
+                                like_num = int(float(vote_clean.upper().replace("M", "")) * 1000000)
+                            else:
+                                like_num = int(vote_clean)
+                        except Exception:
+                            like_num = 0
+
+                    pub_time = r.get("publishedTimeText", {}).get("runs", [{}])[0].get("text", "Recent")
+                    cid = r.get("commentId", f"yt_{video_id}_{len(items)+1}")
+
+                    items.append(
+                        CommentItem(
+                            comment_id=cid,
+                            text=cleaned,
+                            author=author,
+                            author_avatar=None,
+                            like_count=like_num,
+                            published_at=pub_time,
+                            platform="YOUTUBE"
+                        )
+                    )
+                    if max_comments > 0 and len(items) >= max_comments:
+                        break
+
+                continuation_token = find_token(c_data)
+        except Exception as e:
+            print(f"[*] Innertube stream fallback exception: {e}")
+
+        return items
+
     @classmethod
     def fetch_youtube_public_fallback(cls, video_id: str, max_comments: int = 50, sort_order: str = "top") -> List[CommentItem]:
-        """
-        Extracts live comments from any public video/Short via YoutubeCommentDownloader
-        without hitting API quota limits or requiring developer keys.
-        """
         extracted: List[CommentItem] = []
-
         if YoutubeCommentDownloader:
             try:
-                sort_mode = SORT_BY_POPULAR if sort_order in ["top", "Top Liked"] else SORT_BY_RECENT
                 downloader = YoutubeCommentDownloader()
-                raw_generator = downloader.get_comments(video_id, sort_by=sort_mode)
+                if max_comments <= 0:
+                    raw_generator = downloader.get_comments(video_id)
+                else:
+                    sort_mode = SORT_BY_POPULAR if sort_order in ["top", "Top Liked"] else SORT_BY_RECENT
+                    raw_generator = downloader.get_comments(video_id, sort_by=sort_mode)
 
-                for c in islice(raw_generator, max_comments * 2):
+                count = 0
+                for c in raw_generator:
                     raw_text = c.get("text", "")
                     cleaned = cls.clean_unicode_text(raw_text)
-
                     if cls.is_ui_artifact(cleaned):
                         continue
 
+                    count += 1
+                    cid = str(c.get("cid") or "").strip()
+                    final_id = f"yt_{video_id}_{cid}" if cid else f"yt_{video_id}_{count}"
+
+                    raw_votes = c.get("votes", 0)
+                    try:
+                        likes = int(raw_votes or 0)
+                    except Exception:
+                        likes = 0
+
                     extracted.append(
                         CommentItem(
-                            comment_id=str(c.get("cid") or f"yt_{video_id}_{len(extracted)+1}"),
+                            comment_id=final_id,
                             text=cleaned,
                             author=str(c.get("author") or "@anonymous"),
                             author_avatar=None,
-                            like_count=int(c.get("votes", 0) or 0),
+                            like_count=likes,
                             published_at=str(c.get("time", "Recently")),
                             platform="YOUTUBE"
                         )
                     )
-                    if len(extracted) >= max_comments:
+                    if max_comments > 0 and len(extracted) >= max_comments:
                         break
 
                 if extracted:
-                    return extracted
+                    return cls.sort_comment_items(extracted, sort_order)
             except Exception as e:
                 print(f"[Warn] YoutubeCommentDownloader error: {e}")
 
+        # Secondary fallback: Innertube stream when downloader fails on long video formats
+        if not extracted:
+            innertube_items = cls.fetch_youtube_innertube_stream(video_id, max_comments)
+            if innertube_items:
+                return cls.sort_comment_items(innertube_items, sort_order)
+
         return extracted
 
-    # ==========================================
-    # INSTAGRAM EXTRACTION ENGINE (POSTS & REELS)
-    # ==========================================
     @classmethod
     def fetch_instagram_live(cls, shortcode: str, max_comments: int = 50, sort_order: str = "top") -> List[CommentItem]:
-        comments: List[CommentItem] = []
+        items: List[CommentItem] = []
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"https://www.instagram.com/p/{shortcode}/",
+        })
 
-        # 1. First attempt: Public JSON GraphQL endpoint
         try:
-            url = f"https://www.instagram.com/graphql/query/?query_hash=b3055c2e47055004a261cb75215ee58e&variables={{\"shortcode\":\"{shortcode}\",\"first\":{min(max_comments, 50)}}}"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9"
-            }
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                edges = data.get("data", {}).get("shortcode_media", {}).get("edge_media_to_parent_comment", {}).get("edges", [])
+            url = f"https://www.instagram.com/graphql/query/?doc_id=17985449764516708&variables=%7B%22shortcode%22%3A%22{shortcode}%22%2C%22first%22%3A50%7D"
+            resp = session.get(url, timeout=7.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                edges = data.get("data", {}).get("xdt_shortcode_media", {}).get("edge_media_to_parent_comment", {}).get("edges", [])
                 for edge in edges:
                     node = edge.get("node", {})
-                    c_text = cls.clean_unicode_text(node.get("text", ""))
-                    if not cls.is_ui_artifact(c_text) and len(c_text) > 2:
-                        comments.append(
-                            CommentItem(
-                                comment_id=str(node.get("id") or f"ig_{shortcode}_{len(comments)+1}"),
-                                text=c_text,
-                                author=f"@{node.get('owner', {}).get('username', 'anonymous')}",
-                                author_avatar=None,
-                                like_count=int(node.get("edge_liked_by", {}).get("count", 0)),
-                                published_at="Recently",
-                                platform="INSTAGRAM"
-                            )
+                    raw_text = node.get("text", "")
+                    cleaned = cls.clean_unicode_text(raw_text)
+                    if not cleaned or cls.is_ui_artifact(cleaned):
+                        continue
+
+                    author = node.get("owner", {}).get("username", "user")
+                    items.append(
+                        CommentItem(
+                            comment_id=node.get("id", f"ig_{shortcode}_{len(items)+1}"),
+                            text=cleaned,
+                            author=f"@{author}",
+                            author_avatar=node.get("owner", {}).get("profile_pic_url", None),
+                            like_count=int(node.get("edge_liked_by", {}).get("count", 0)),
+                            published_at=str(node.get("created_at", "Recent")),
+                            platform="INSTAGRAM"
                         )
-                        if len(comments) >= max_comments:
-                            break
-                if comments:
-                    return comments
+                    )
+                    if max_comments > 0 and len(items) >= max_comments:
+                        break
         except Exception as e:
             print(f"[Warn] Instagram GraphQL fetch skipped: {e}")
 
-        # 2. Second attempt: Instaloader
-        if instaloader:
-            try:
-                L = instaloader.Instaloader(
-                    download_pictures=False,
-                    download_videos=False,
-                    download_video_thumbnails=False,
-                    download_geotags=False,
-                    download_comments=True,
-                    save_metadata=False,
-                    compress_history=False
-                )
-                post = instaloader.Post.from_shortcode(L.context, shortcode)
+        if items:
+            return cls.sort_comment_items(items, sort_order)
+        return []
 
-                for c in post.get_comments():
-                    cleaned = cls.clean_unicode_text(c.text)
-                    if not cls.is_ui_artifact(cleaned) and len(cleaned) > 2:
-                        comments.append(
-                            CommentItem(
-                                comment_id=f"ig_{shortcode}_{c.id}",
-                                text=cleaned,
-                                author=f"@{c.owner.username}",
-                                author_avatar=None,
-                                like_count=getattr(c, "likes_count", 0) or 0,
-                                published_at=str(c.created_at_utc)[:10] if hasattr(c, "created_at_utc") else "Recent",
-                                platform="INSTAGRAM"
-                            )
-                        )
-                    if len(comments) >= max_comments:
-                        break
-
-                if sort_order in ["top", "Top Liked"]:
-                    comments = sorted(comments, key=lambda x: x.like_count, reverse=True)
-
-            except Exception as e:
-                print(f"[Warn] Instaloader error: {e}")
-
-        return comments
-
-    # ==========================================
-    # UNIFIED PUBLIC DISPATCHER
-    # ==========================================
     @classmethod
     def get_comments(
         cls, url: str, api_key: str = "", max_comments: int = 50, sort_order: str = "top"
@@ -343,7 +465,7 @@ class SocialScraperService:
                     published_at=t[3],
                     platform="YOUTUBE"
                 )
-                for idx, t in enumerate(yt_pool[:max_comments])
+                for idx, t in enumerate(yt_pool if max_comments == 0 else yt_pool[:max_comments])
             ]
 
         elif platform == "INSTAGRAM":
@@ -378,3 +500,6 @@ class SocialScraperService:
                 )
                 for i, t in enumerate(ig_pool[:max_comments])
             ]
+
+
+social_scraper_service = SocialScraperService()
