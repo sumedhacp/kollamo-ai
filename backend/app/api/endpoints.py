@@ -1,4 +1,4 @@
-# backend/app/api/endpoints.py
+import os
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List
 
@@ -16,19 +16,16 @@ from app.services.summary_generator import ExecutiveReviewGenerator
 
 router = APIRouter()
 
-# Instantiate transformer pipeline once on startup
-inference_engine = SentimentInferenceEngine(model_name_or_path="google/muril-base-cased", device="cpu")
+# Dynamically locate ml/saved_model directory
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+DEFAULT_MODEL_PATH = os.path.join(BASE_DIR, "ml", "saved_model")
+MODEL_PATH = os.getenv("SENTIMENT_MODEL_PATH", DEFAULT_MODEL_PATH)
+
+# Instantiate fine-tuned pipeline once on startup
+inference_engine = SentimentInferenceEngine(model_name_or_path=MODEL_PATH, device="cpu")
 
 @router.post("/analyze-single", response_model=SingleTextResponse, tags=["Inference"])
 def analyze_single_comment(request: SingleTextRequest):
-    """
-    Analyzes an individual comment:
-    - Normalizes informal Manglish phonetics & collapses vowel repeats
-    - Enforces language guardrails (Malayalam, Manglish, English only)
-    - Tags token linguistic categories ([ENGLISH], [MANGLISH], [MALAYALAM_SCRIPT])
-    - Provides semantic English translation
-    - Evaluates calibrated multi-class distribution and dual-span mixed sentiment
-    """
     try:
         result = inference_engine.predict_single(request.text)
         return SingleTextResponse(**result)
@@ -37,10 +34,6 @@ def analyze_single_comment(request: SingleTextRequest):
 
 @router.post("/scrape-comments", response_model=ScrapeResponse, tags=["Scraper"])
 def scrape_social_comments(request: ScrapeRequest):
-    """
-    Extracts authentic user comments from public YouTube or Instagram links.
-    Filters UI artifacts, channel headers, and player controls.
-    """
     try:
         platform, media_id, comments = SocialScraperService.get_comments(
             url=str(request.url),
@@ -51,6 +44,7 @@ def scrape_social_comments(request: ScrapeRequest):
             platform=platform,
             media_id=media_id,
             total_extracted=len(comments),
+            requested_limit=request.max_comments,
             sort_order=request.sort_order,
             comments=comments
         )
@@ -61,10 +55,6 @@ def scrape_social_comments(request: ScrapeRequest):
 
 @router.post("/analyze-batch", response_model=BatchAnalyzeResponse, tags=["Batch Analytics"])
 def analyze_batch_comments(request: BatchAnalyzeRequest):
-    """
-    Executes full pipeline analysis over curated comments:
-    Inference + Token Tagging + Translation + Executive Review Summary generation.
-    """
     if not request.comments:
         raise HTTPException(status_code=400, detail="Comments payload cannot be empty.")
 
@@ -122,9 +112,6 @@ def analyze_batch_comments(request: BatchAnalyzeRequest):
 
 @router.post("/generate-summary", tags=["Analytics Summary"])
 def generate_executive_summary(comments: List[AnalyzedCommentItem]):
-    """
-    Generates an executive audience reception briefing for a set of analyzed comments.
-    """
     dict_items = [c.dict() for c in comments]
     summary = ExecutiveReviewGenerator.generate_summary(dict_items)
     return summary

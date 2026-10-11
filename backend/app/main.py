@@ -22,3 +22,11 @@ app.include_router(api_router, prefix="/api")
 @app.get("/health", tags=["Health"])
 def health_check():
     return {"status": "healthy", "engine": "Kollamo.ai MuRIL Sequence Classifier"}
+
+@app.get("/")
+def read_root():
+    return {
+        "status": "online",
+        "service": "Kollamo.ai Backend",
+        "docs_url": "/docs"
+    }
