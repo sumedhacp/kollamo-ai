@@ -7,10 +7,10 @@ import numpy as np
 from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+from app.services.translator import translation_service
 from app.services.normalizer import (
     ManglishPhoneticNormalizer,
     TokenLanguageTagger,
-    GoogleTranslationService
 )
 from app.services.language_guard import LanguageGuardService
 
@@ -77,12 +77,10 @@ class SentimentInferenceEngine:
 
         biased_logits = logits.copy()
         if neg_hits > pos_hits:
-            # Boost negative logit (index 1), penalize positive (index 0)
             boost = 2.5 * (neg_hits - pos_hits)
             biased_logits[1] += boost
             biased_logits[0] -= boost
         elif pos_hits > neg_hits:
-            # Boost positive logit (index 0), penalize negative (index 1)
             boost = 2.5 * (pos_hits - neg_hits)
             biased_logits[0] += boost
             biased_logits[1] -= boost
@@ -122,7 +120,6 @@ class SentimentInferenceEngine:
                 s1, s2 = spans[0].strip(), spans[1].strip()
                 l1, d1 = self._score_clause(s1)
                 l2, d2 = self._score_clause(s2)
-                # Mixed sentiment requires genuine polarity contradiction between clauses
                 if (l1 == "Positive" and l2 == "Negative") or (l1 == "Negative" and l2 == "Positive"):
                     return True, [
                         {"span_text": s1, "label": l1, "score": round(d1[l1] * 100, 1)},
@@ -155,7 +152,8 @@ class SentimentInferenceEngine:
         tokens = TokenLanguageTagger.tag_tokens(raw_text, norm_map)
         token_details = [{"token": t.token, "normalized": t.normalized, "type": t.tag} for t in tokens]
 
-        translated = GoogleTranslationService.translate(norm_text)
+        # Use the beam-search translator on the raw text
+        translated = translation_service.translate(raw_text)
         is_mixed, spans = self.detect_mixed(norm_text)
 
         best_label, probs = self._score_clause(norm_text)

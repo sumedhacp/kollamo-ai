@@ -17,7 +17,7 @@ def run_tests():
     # 1. Health Check
     res = client.get("/health")
     assert res.status_code == 200, f"Health check failed: {res.text}"
-    print(f"[TEST 1] GET /health -> Status 200 OK | Response: {res.json()['system']}")
+    print(f"[TEST 1] GET /health -> Status 200 OK | Response: {res.json().get('engine', res.json().get('status'))}")
 
     # 2. Single Analysis Route
     single_payload = {"text": "Padam thooki! Climax scene romancham aayirunnu 🔥🔥"}
@@ -65,7 +65,7 @@ def run_tests():
     summary = res.json()
     print(f"\n[TEST 5] POST /api/generate-summary -> Status 200 OK")
     print(f" -> Headline: {summary['headline']}")
-    print(f" -> Narrative: \"{summary['narrative']}\"")
+    print(f" -> Narrative: \"{summary.get('verdict', summary.get('narrative', ''))}\"")
     print(f" -> Net Sentiment Score: {summary['net_sentiment_score']}")
 
     print("\n" + "=" * 80)
@@ -74,3 +74,4 @@ def run_tests():
 
 if __name__ == "__main__":
     run_tests()
+
