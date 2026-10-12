@@ -110,6 +110,36 @@ class ManglishTranslatorService:
             pass
         return ""
 
+    _cache: Dict[str, str] = {}
+
+    @classmethod
+    def translate_batch(cls, texts: List[str], max_workers: int = 10) -> List[str]:
+        from concurrent.futures import ThreadPoolExecutor
+
+        results = [None] * len(texts)
+        indices_to_fetch = []
+        texts_to_fetch = []
+
+        for idx, text in enumerate(texts):
+            cleaned = text.strip()
+            if not cleaned:
+                results[idx] = ''
+            elif cleaned in cls._cache:
+                results[idx] = cls._cache[cleaned]
+            else:
+                indices_to_fetch.append(idx)
+                texts_to_fetch.append(cleaned)
+
+        if texts_to_fetch:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(texts_to_fetch))) as executor:
+                fetched_translations = list(executor.map(cls.translate_manglish_to_english, texts_to_fetch))
+
+            for orig_idx, orig_text, trans in zip(indices_to_fetch, texts_to_fetch, fetched_translations):
+                cls._cache[orig_text] = trans
+                results[orig_idx] = trans
+
+        return results
+
     @classmethod
     def translate_manglish_to_english(cls, text: str) -> str:
         cleaned = text.strip()

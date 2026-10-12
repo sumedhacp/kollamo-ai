@@ -182,5 +182,122 @@ class SentimentInferenceEngine:
             "latency_ms": round((time.time() - start) * 1000, 2)
         }
     
-    def predict_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
-        return [self.predict_single(t) for t in texts]
+    def _score_batch(self, texts: List[str]) -> List[Tuple[str, Dict[str, float]]]:
+        if not texts:
+            return []
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=64,
+            return_tensors="pt"
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            raw_logits_batch = outputs.logits.cpu().numpy()
+
+        results = []
+        for text, raw_logits in zip(texts, raw_logits_batch):
+            calibrated = self._apply_lexical_bias(text, raw_logits)
+            exp_logits = np.exp(calibrated - np.max(calibrated))
+            probs = exp_logits / exp_logits.sum()
+            dist = {
+                self.ID2LABEL[i]: round(float(probs[i]), 4)
+                for i in range(3)
+            }
+            best = max(dist, key=dist.get)
+            results.append((best, dist))
+        return results
+
+    def predict_batch(self, texts: List[str], batch_size: int = 16) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = [None] * len(texts)
+        supported_indices: List[int] = []
+        supported_texts_norm: List[str] = []
+        preprocessed_data: Dict[int, Dict[str, Any]] = {}
+
+        # Step 1: Preprocessing & Language Guardrail
+        for idx, raw_text in enumerate(texts):
+            start = time.time()
+            is_supported, lang_type, err_msg = LanguageGuardService.validate_text(raw_text)
+            if not is_supported:
+                results[idx] = {
+                    "raw_text": raw_text,
+                    "cleaned_text": "",
+                    "is_supported": False,
+                    "language_type": lang_type,
+                    "error_message": err_msg,
+                    "translated_text": None,
+                    "token_breakdown": [],
+                    "label": "Unsupported",
+                    "confidence": 0.0,
+                    "probabilities": {"Positive": 0.0, "Negative": 0.0, "Neutral": 0.0},
+                    "is_mixed_sentiment": False,
+                    "conflicting_spans": [],
+                    "latency_ms": round((time.time() - start) * 1000, 2)
+                }
+            else:
+                norm_text, norm_map = ManglishPhoneticNormalizer.normalize_sentence(raw_text)
+                tokens = TokenLanguageTagger.tag_tokens(raw_text, norm_map)
+                token_details = [{"token": t.token, "normalized": t.normalized, "type": t.tag} for t in tokens]
+                is_mixed, spans = self.detect_mixed(norm_text)
+
+                supported_indices.append(idx)
+                supported_texts_norm.append(norm_text)
+                preprocessed_data[idx] = {
+                    "raw_text": raw_text,
+                    "norm_text": norm_text,
+                    "lang_type": lang_type,
+                    "token_details": token_details,
+                    "translated": "",
+                    "is_mixed": is_mixed,
+                    "spans": spans,
+                    "start_time": start
+                }
+
+        # Step 2: Concurrent Batch Translation & PyTorch Tensor Inference
+        supported_raw_texts = [preprocessed_data[i]["raw_text"] for i in supported_indices]
+        if hasattr(translation_service, 'translate_batch'):
+            translations = translation_service.translate_batch(supported_raw_texts)
+        else:
+            translations = [translation_service.translate(t) for t in supported_raw_texts]
+
+        for orig_idx, trans in zip(supported_indices, translations):
+            preprocessed_data[orig_idx]["translated"] = trans
+
+        scored_pairs: List[Tuple[str, Dict[str, float]]] = []
+        for i in range(0, len(supported_texts_norm), batch_size):
+            chunk = supported_texts_norm[i:i + batch_size]
+            scored_pairs.extend(self._score_batch(chunk))
+
+        # Step 3: Assembly
+        for orig_idx, (best_label, probs) in zip(supported_indices, scored_pairs):
+            meta = preprocessed_data[orig_idx]
+            is_mixed = meta["is_mixed"]
+            spans = meta["spans"]
+
+            if is_mixed and spans:
+                best_label = "Mixed"
+                confidence = max(spans[0]["score"], spans[1]["score"])
+            else:
+                is_mixed = False
+                spans = []
+                confidence = round(probs[best_label] * 100, 2)
+
+            results[orig_idx] = {
+                "raw_text": meta["raw_text"],
+                "cleaned_text": meta["norm_text"],
+                "is_supported": True,
+                "language_type": meta["lang_type"],
+                "error_message": None,
+                "translated_text": meta["translated"],
+                "token_breakdown": meta["token_details"],
+                "label": best_label,
+                "confidence": confidence,
+                "probabilities": probs,
+                "is_mixed_sentiment": is_mixed,
+                "conflicting_spans": spans,
+                "latency_ms": round((time.time() - meta["start_time"]) * 1000, 2)
+            }
+
+        return results

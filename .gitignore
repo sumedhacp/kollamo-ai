@@ -22,21 +22,14 @@ frontend/dist/
 # OS-specific files
 .DS_Store
 Thumbs.db
-<<<<<<< HEAD
 .tmp/
 ml/checkpoints/
 ml/data/
 
-<<<<<<< HEAD
 
 .cache/
 
-=======
 
-.tmp/
->>>>>>> origin/feature/milestone-6-audience-intelligence
-=======
-.tmp/
-.cache/
 
->>>>>>> origin/feature/nlp-muril-finetuning
+
+
