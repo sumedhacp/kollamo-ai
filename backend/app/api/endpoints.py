@@ -61,8 +61,10 @@ def analyze_batch_comments(request: BatchAnalyzeRequest):
     analyzed_items: List[AnalyzedCommentItem] = []
     distribution = {"Positive": 0, "Negative": 0, "Neutral": 0, "Mixed": 0, "Unsupported": 0}
 
-    for item in request.comments:
-        pred = inference_engine.predict_single(item.text)
+    texts = [item.text for item in request.comments]
+    predictions = inference_engine.predict_batch(texts)
+
+    for item, pred in zip(request.comments, predictions):
         label = pred["label"]
         distribution[label] = distribution.get(label, 0) + 1
 
