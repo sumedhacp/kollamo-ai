@@ -17,7 +17,7 @@ def run_tests():
     # 1. Health Check
     res = client.get("/health")
     assert res.status_code == 200, f"Health check failed: {res.text}"
-    print(f"[TEST 1] GET /health -> Status 200 OK | Response: {res.json()['system']}")
+    print(f"[TEST 1] GET /health -> Status 200 OK | Response: {res.json().get('engine', res.json().get('status'))}")
 
     # 2. Single Analysis Route
     single_payload = {"text": "Padam thooki! Climax scene romancham aayirunnu 🔥🔥"}
